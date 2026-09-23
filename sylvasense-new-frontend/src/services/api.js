@@ -1,6 +1,6 @@
 const API_BASE = (
   import.meta.env.VITE_API_BASE_URL ||
-  "http://localhost:8001"
+  "https://sylvasense-backend-kc8t.onrender.com"
 ).replace(/\/$/, "");
 
 /**
