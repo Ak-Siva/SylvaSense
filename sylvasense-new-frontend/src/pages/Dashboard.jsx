@@ -42,20 +42,10 @@ function Availability({ status, label }) {
    FIND CANOPY COVERAGE
 ========================================================= */
 
-/*
-  The backend may return canopy_coverage_percent
-  directly, inside an array, or nested inside another object.
-
-  This function searches the complete crown segmentation
-  response until it finds the first valid value.
-*/
-
 function findCanopyCoverage(data) {
   if (data === null || data === undefined) {
     return null;
   }
-
-  /* Direct canopy value */
 
   if (
     typeof data === "object" &&
@@ -72,8 +62,6 @@ function findCanopyCoverage(data) {
     }
   }
 
-  /* Array */
-
   if (Array.isArray(data)) {
     for (const item of data) {
       const value = findCanopyCoverage(item);
@@ -89,8 +77,6 @@ function findCanopyCoverage(data) {
 
     return null;
   }
-
-  /* Nested object */
 
   if (typeof data === "object") {
     for (const [key, value] of Object.entries(data)) {
@@ -127,6 +113,22 @@ function findCanopyCoverage(data) {
 }
 
 /* =========================================================
+   SAFE VALUE
+========================================================= */
+
+function displayValue(value, digits = 2) {
+  if (
+    value === null ||
+    value === undefined ||
+    Number.isNaN(Number(value))
+  ) {
+    return "—";
+  }
+
+  return fmt(Number(value), digits);
+}
+
+/* =========================================================
    DASHBOARD
 ========================================================= */
 
@@ -136,7 +138,7 @@ export default function Dashboard({
   setPage,
 }) {
   /* =======================================================
-     TREE COUNT
+     TREE DETECTION
   ======================================================= */
 
   const treeCount =
@@ -151,10 +153,6 @@ export default function Dashboard({
 
   const crownSegmentation =
     result?.modules?.crown_segmentation;
-
-  /* =======================================================
-     CROWN COUNT
-  ======================================================= */
 
   const crownCount =
     result?.crown_count ??
@@ -191,7 +189,7 @@ export default function Dashboard({
     null;
 
   /* =======================================================
-     CO2 EQUIVALENT
+     CO2e
   ======================================================= */
 
   const co2e =
@@ -202,18 +200,31 @@ export default function Dashboard({
     null;
 
   /* =======================================================
-     CANOPY COVERAGE
+     CANOPY
   ======================================================= */
 
   const canopyCoverage =
-    findCanopyCoverage(crownSegmentation);
+    findCanopyCoverage(
+      crownSegmentation
+    );
 
   const canopyDisplay =
     canopyCoverage !== null &&
     canopyCoverage !== undefined &&
     !Number.isNaN(canopyCoverage)
-      ? `${fmt(canopyCoverage)}%`
+      ? `${displayValue(
+          canopyCoverage,
+          2
+        )}%`
       : "—";
+
+  /* =======================================================
+     ANALYSIS STATUS
+  ======================================================= */
+
+  const hasAnalysis =
+    result !== null &&
+    result !== undefined;
 
   /* =======================================================
      RENDER
@@ -228,7 +239,7 @@ export default function Dashboard({
       <PageHeader
         icon={Gauge}
         title="Forest Intelligence Dashboard"
-        description="A unified view of forest imagery analysis, Earth observation and biomass intelligence."
+        description="Central overview of SylvaSense forest analysis, Earth observation and biomass intelligence."
       />
 
       {/* ===================================================
@@ -247,7 +258,8 @@ export default function Dashboard({
           </h3>
 
           <p className="muted">
-            FastAPI backend connection and analysis services.
+            FastAPI backend and connected forest
+            intelligence services.
           </p>
         </div>
 
@@ -277,16 +289,12 @@ export default function Dashboard({
 
       <div className="metrics-grid">
 
-        {/* TREES DETECTED */}
-
         <MetricCard
           icon={Trees}
           title="Trees Detected"
           value={fmt(treeCount, 0)}
           accent="metric-green"
         />
-
-        {/* TREE CROWNS */}
 
         <MetricCard
           icon={TreePine}
@@ -295,27 +303,21 @@ export default function Dashboard({
           accent="metric-green"
         />
 
-        {/* ABOVEGROUND BIOMASS */}
-
         <MetricCard
           icon={BarChart3}
           title="Aboveground Biomass"
-          value={fmt(agb)}
+          value={displayValue(agb)}
           unit="t"
           accent="metric-blue"
         />
 
-        {/* CARBON */}
-
         <MetricCard
           icon={Leaf}
           title="Carbon"
-          value={fmt(carbon)}
+          value={displayValue(carbon)}
           unit="t C"
           accent="metric-green"
         />
-
-        {/* CANOPY COVERAGE */}
 
         <MetricCard
           icon={Activity}
@@ -327,7 +329,7 @@ export default function Dashboard({
       </div>
 
       {/* ===================================================
-          TWO COLUMN SECTION
+          MAIN TWO COLUMN AREA
       =================================================== */}
 
       <div className="two-column">
@@ -341,67 +343,57 @@ export default function Dashboard({
           <div className="panel-head">
 
             <div>
-
               <h3>
                 Latest Analysis
               </h3>
 
               <p>
-                Most recent forest image processed by the AI
-                pipeline.
+                Summary of the most recent forest
+                image processed by SylvaSense.
               </p>
-
             </div>
 
-            {result && (
+            {hasAnalysis && (
               <span className="badge success">
-                LIVE
+                ANALYZED
               </span>
             )}
 
           </div>
 
-          {!result ? (
-
-            /* ===============================================
-               NO ANALYSIS
-            =============================================== */
+          {!hasAnalysis ? (
 
             <div className="empty-panel">
 
-              <ScanSearch size={30} />
+              <ScanSearch size={32} />
 
               <strong>
                 No analysis available
               </strong>
 
               <span>
-                Upload a forest image to begin analysis.
+                Upload a forest image to generate
+                tree, crown and biomass intelligence.
               </span>
 
               <button
                 className="secondary-btn"
-                onClick={() => setPage("image")}
+                onClick={() =>
+                  setPage("image")
+                }
               >
                 <ScanSearch size={17} />
 
-                Open Image Analysis
+                Start Image Analysis
               </button>
 
             </div>
 
           ) : (
 
-            /* ===============================================
-               ANALYSIS SUMMARY
-            =============================================== */
-
             <div className="analysis-summary">
 
-              {/* TREES */}
-
               <div className="summary-row">
-
                 <span>
                   Trees detected
                 </span>
@@ -409,69 +401,49 @@ export default function Dashboard({
                 <strong>
                   {fmt(treeCount, 0)}
                 </strong>
-
               </div>
 
-              {/* CROWNS */}
-
               <div className="summary-row">
-
                 <span>
-                  Crown segmentation
+                  Tree crowns
                 </span>
 
                 <strong>
                   {fmt(crownCount, 0)}
                 </strong>
-
               </div>
 
-              {/* AGB */}
-
               <div className="summary-row">
-
                 <span>
                   Aboveground biomass
                 </span>
 
                 <strong>
-                  {fmt(agb)} t
+                  {displayValue(agb)} t
                 </strong>
-
               </div>
 
-              {/* CARBON */}
-
               <div className="summary-row">
-
                 <span>
-                  Carbon
+                  Carbon stored
                 </span>
 
                 <strong>
-                  {fmt(carbon)} t C
+                  {displayValue(carbon)} t C
                 </strong>
-
               </div>
 
-              {/* CO2 */}
-
               <div className="summary-row">
-
                 <span>
-                  CO₂e
+                  CO₂ equivalent
                 </span>
 
                 <strong>
-                  {fmt(co2e)} t
+                  {displayValue(co2e)} t
                 </strong>
-
               </div>
 
-              {/* CANOPY */}
-
               <div className="summary-row">
-
                 <span>
                   Canopy coverage
                 </span>
@@ -479,18 +451,17 @@ export default function Dashboard({
                 <strong>
                   {canopyDisplay}
                 </strong>
-
               </div>
-
-              {/* FULL ANALYSIS */}
 
               <button
                 className="secondary-btn full"
-                onClick={() => setPage("image")}
+                onClick={() =>
+                  setPage("image")
+                }
               >
                 <ScanSearch size={17} />
 
-                View Full Analysis
+                View Full Image Analysis
               </button>
 
             </div>
@@ -500,7 +471,7 @@ export default function Dashboard({
         </div>
 
         {/* =================================================
-            EARTH OBSERVATION MODULES
+            EARTH OBSERVATION
         ================================================= */}
 
         <div className="panel">
@@ -508,15 +479,14 @@ export default function Dashboard({
           <div className="panel-head">
 
             <div>
-
               <h3>
-                Earth Observation Modules
+                Earth Observation
               </h3>
 
               <p>
-                Remote sensing services connected to FastAPI.
+                Explore satellite data and
+                forecasting separately.
               </p>
-
             </div>
 
           </div>
@@ -527,7 +497,9 @@ export default function Dashboard({
 
             <button
               className="module-item"
-              onClick={() => setPage("satellite")}
+              onClick={() =>
+                setPage("satellite")
+              }
             >
 
               <div className="module-icon">
@@ -535,7 +507,6 @@ export default function Dashboard({
               </div>
 
               <div>
-
                 <strong>
                   Satellite Intelligence
                 </strong>
@@ -543,7 +514,6 @@ export default function Dashboard({
                 <span>
                   Sentinel-1, Sentinel-2 and GEDI
                 </span>
-
               </div>
 
               <span className="module-arrow">
@@ -556,7 +526,9 @@ export default function Dashboard({
 
             <button
               className="module-item"
-              onClick={() => setPage("change")}
+              onClick={() =>
+                setPage("change")
+              }
             >
 
               <div className="module-icon">
@@ -564,15 +536,14 @@ export default function Dashboard({
               </div>
 
               <div>
-
                 <strong>
                   Change Detection
                 </strong>
 
                 <span>
-                  Compare Earth observation periods
+                  Compare forest conditions
+                  across observation periods
                 </span>
-
               </div>
 
               <span className="module-arrow">
@@ -581,11 +552,13 @@ export default function Dashboard({
 
             </button>
 
-            {/* AGB FORECAST */}
+            {/* FORECAST */}
 
             <button
               className="module-item"
-              onClick={() => setPage("forecast")}
+              onClick={() =>
+                setPage("forecast")
+              }
             >
 
               <div className="module-icon">
@@ -593,15 +566,13 @@ export default function Dashboard({
               </div>
 
               <div>
-
                 <strong>
                   AGB Forecast
                 </strong>
 
                 <span>
-                  Biomass projection from backend
+                  Project future aboveground biomass
                 </span>
-
               </div>
 
               <span className="module-arrow">
@@ -625,16 +596,14 @@ export default function Dashboard({
         <div className="panel-head">
 
           <div>
-
             <h3>
               Service Availability
             </h3>
 
             <p>
-              Current connection state of the SylvaSense
-              backend.
+              Current connection state of the
+              SylvaSense analysis pipeline.
             </p>
-
           </div>
 
         </div>
@@ -666,7 +635,7 @@ export default function Dashboard({
       </div>
 
       {/* ===================================================
-          NOTICE
+          DATA NOTICE
       =================================================== */}
 
       <div className="notice">
@@ -674,9 +643,10 @@ export default function Dashboard({
         <BrainCircuit size={19} />
 
         <span>
-          Dashboard values are populated from the latest
-          backend analysis response. No frontend-generated
-          tree, biomass or carbon values are substituted.
+          Dashboard metrics are read from the latest
+          backend analysis response. SylvaSense does
+          not generate replacement tree, biomass,
+          carbon or canopy values on the frontend.
         </span>
 
       </div>
