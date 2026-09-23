@@ -2,130 +2,129 @@ import React from "react";
 
 import {
   Activity,
+  ArrowRight,
   BarChart3,
   BrainCircuit,
-  Gauge,
+  CheckCircle2,
+  Clock3,
   Layers3,
-  Leaf,
+  Map,
   ScanSearch,
   Satellite,
   TreePine,
-  Trees,
+  Upload,
 } from "lucide-react";
 
 import PageHeader from "../components/PageHeader";
-import MetricCard from "../components/MetricCard";
 import StatusDot from "../components/StatusDot";
 
-import { fmt } from "../utils/normalize";
 import { getApiBase } from "../services/api";
 
 /* =========================================================
-   AVAILABILITY
+   MODULE CARD
 ========================================================= */
 
-function Availability({ status, label }) {
+function ModuleCard({
+  icon: Icon,
+  title,
+  description,
+  status,
+  statusText,
+  onClick,
+}) {
   return (
-    <div className="availability">
-      <StatusDot status={status} />
+    <button
+      className="dashboard-module-card"
+      onClick={onClick}
+    >
+      <div className="dashboard-module-top">
 
-      <span>{label}</span>
+        <div className="dashboard-module-icon">
+          <Icon size={23} />
+        </div>
 
-      <strong>
-        {status ? "READY" : "UNAVAILABLE"}
-      </strong>
-    </div>
+        <span
+          className={`dashboard-module-status ${
+            status ? "online" : "offline"
+          }`}
+        >
+          <span className="dashboard-status-dot" />
+
+          {statusText}
+        </span>
+
+      </div>
+
+      <div className="dashboard-module-content">
+
+        <h3>
+          {title}
+        </h3>
+
+        <p>
+          {description}
+        </p>
+
+      </div>
+
+      <div className="dashboard-module-footer">
+
+        <span>
+          Open module
+        </span>
+
+        <ArrowRight size={17} />
+
+      </div>
+    </button>
   );
 }
 
 /* =========================================================
-   FIND CANOPY COVERAGE
+   PIPELINE STEP
 ========================================================= */
 
-function findCanopyCoverage(data) {
-  if (data === null || data === undefined) {
-    return null;
-  }
+function PipelineStep({
+  number,
+  icon: Icon,
+  title,
+  description,
+  active,
+  completed,
+}) {
+  return (
+    <div
+      className={`pipeline-step ${
+        active ? "active" : ""
+      } ${completed ? "completed" : ""}`}
+    >
+      <div className="pipeline-step-number">
 
-  if (
-    typeof data === "object" &&
-    !Array.isArray(data) &&
-    data.canopy_coverage_percent !== null &&
-    data.canopy_coverage_percent !== undefined
-  ) {
-    const value = Number(
-      data.canopy_coverage_percent
-    );
+        {completed ? (
+          <CheckCircle2 size={19} />
+        ) : (
+          number
+        )}
 
-    if (!Number.isNaN(value)) {
-      return value;
-    }
-  }
+      </div>
 
-  if (Array.isArray(data)) {
-    for (const item of data) {
-      const value = findCanopyCoverage(item);
+      <div className="pipeline-step-icon">
+        <Icon size={19} />
+      </div>
 
-      if (
-        value !== null &&
-        value !== undefined &&
-        !Number.isNaN(value)
-      ) {
-        return value;
-      }
-    }
+      <div className="pipeline-step-content">
 
-    return null;
-  }
+        <strong>
+          {title}
+        </strong>
 
-  if (typeof data === "object") {
-    for (const [key, value] of Object.entries(data)) {
-      if (
-        key === "canopy_coverage_percent" &&
-        value !== null &&
-        value !== undefined
-      ) {
-        const numberValue = Number(value);
+        <span>
+          {description}
+        </span>
 
-        if (!Number.isNaN(numberValue)) {
-          return numberValue;
-        }
-      }
-
-      if (
-        value !== null &&
-        typeof value === "object"
-      ) {
-        const found = findCanopyCoverage(value);
-
-        if (
-          found !== null &&
-          found !== undefined &&
-          !Number.isNaN(found)
-        ) {
-          return found;
-        }
-      }
-    }
-  }
-
-  return null;
-}
-
-/* =========================================================
-   SAFE VALUE
-========================================================= */
-
-function displayValue(value, digits = 2) {
-  if (
-    value === null ||
-    value === undefined ||
-    Number.isNaN(Number(value))
-  ) {
-    return "—";
-  }
-
-  return fmt(Number(value), digits);
+      </div>
+    </div>
+  );
 }
 
 /* =========================================================
@@ -137,94 +136,57 @@ export default function Dashboard({
   backendOnline,
   setPage,
 }) {
-  /* =======================================================
-     TREE DETECTION
-  ======================================================= */
-
-  const treeCount =
-    result?.tree_count ??
-    result?.treeCount ??
-    result?.modules?.tree_detection?.tree_count ??
-    0;
-
-  /* =======================================================
-     CROWN SEGMENTATION
-  ======================================================= */
-
-  const crownSegmentation =
-    result?.modules?.crown_segmentation;
-
-  const crownCount =
-    result?.crown_count ??
-    result?.crownCount ??
-    result?.modules?.crown_segmentation?.tree_count ??
-    result?.modules?.crown_segmentation?.crown_count ??
-    (Array.isArray(crownSegmentation)
-      ? crownSegmentation.length
-      : 0);
-
-  /* =======================================================
-     BIOMASS
-  ======================================================= */
-
-  const biomass =
-    result?.modules?.biomass ?? {};
-
-  const agb =
-    biomass?.total_agb_tonnes ??
-    result?.total_agb_tonnes ??
-    result?.agb ??
-    null;
-
-  /* =======================================================
-     CARBON
-  ======================================================= */
-
-  const carbon =
-    biomass?.total_carbon_tonnes ??
-    result?.total_carbon_tonnes ??
-    result?.carbon ??
-    result?.carbon_tonnes ??
-    result?.carbonValue ??
-    null;
-
-  /* =======================================================
-     CO2e
-  ======================================================= */
-
-  const co2e =
-    biomass?.total_co2e_tonnes ??
-    result?.total_co2e_tonnes ??
-    result?.co2e ??
-    result?.co2eValue ??
-    null;
-
-  /* =======================================================
-     CANOPY
-  ======================================================= */
-
-  const canopyCoverage =
-    findCanopyCoverage(
-      crownSegmentation
-    );
-
-  const canopyDisplay =
-    canopyCoverage !== null &&
-    canopyCoverage !== undefined &&
-    !Number.isNaN(canopyCoverage)
-      ? `${displayValue(
-          canopyCoverage,
-          2
-        )}%`
-      : "—";
-
-  /* =======================================================
-     ANALYSIS STATUS
-  ======================================================= */
-
   const hasAnalysis =
     result !== null &&
     result !== undefined;
+
+  /*
+   * These values are used ONLY to determine whether
+   * the pipeline has produced an analysis.
+   *
+   * They are not displayed as duplicate metrics.
+   */
+
+  const hasTreeDetection =
+    result?.modules?.tree_detection ||
+    result?.tree_count !== undefined ||
+    result?.treeCount !== undefined;
+
+  const hasCrownSegmentation =
+    result?.modules?.crown_segmentation;
+
+  const hasBiomass =
+    result?.modules?.biomass ||
+    result?.total_agb_tonnes !== undefined ||
+    result?.agb !== undefined;
+
+  /* =======================================================
+     CURRENT PIPELINE STATE
+  ======================================================= */
+
+  let pipelineStage = "Ready for analysis";
+
+  if (hasAnalysis) {
+    pipelineStage = "Analysis completed";
+  }
+
+  if (
+    hasAnalysis &&
+    hasTreeDetection &&
+    !hasCrownSegmentation
+  ) {
+    pipelineStage =
+      "Tree detection completed";
+  }
+
+  if (
+    hasAnalysis &&
+    hasCrownSegmentation &&
+    !hasBiomass
+  ) {
+    pipelineStage =
+      "Crown segmentation completed";
+  }
 
   /* =======================================================
      RENDER
@@ -237,43 +199,60 @@ export default function Dashboard({
       =================================================== */}
 
       <PageHeader
-        icon={Gauge}
-        title="Forest Intelligence Dashboard"
-        description="Central overview of SylvaSense forest analysis, Earth observation and biomass intelligence."
+        icon={GaugeIcon}
+        title="Forest Intelligence Center"
+        description="Monitor your SylvaSense analysis workflow and access every forest intelligence module from one place."
       />
 
       {/* ===================================================
-          SYSTEM STATUS
+          SYSTEM OVERVIEW
       =================================================== */}
 
-      <div className="dashboard-status panel">
+      <section className="dashboard-hero panel">
 
-        <div>
-          <div className="panel-kicker">
-            SYSTEM STATUS
+        <div className="dashboard-hero-main">
+
+          <div className="dashboard-hero-icon">
+            <TreePine size={30} />
           </div>
 
-          <h3>
-            SylvaSense AI Pipeline
-          </h3>
+          <div>
 
-          <p className="muted">
-            FastAPI backend and connected forest
-            intelligence services.
-          </p>
+            <div className="panel-kicker">
+              SYLVASENSE FOREST INTELLIGENCE
+            </div>
+
+            <h2>
+              {hasAnalysis
+                ? "Forest analysis is available"
+                : "Ready for forest analysis"}
+            </h2>
+
+            <p>
+              {hasAnalysis
+                ? "Your latest AI processing is complete. Use the modules below to explore the detailed results."
+                : "Upload forest imagery or select a satellite location to begin extracting forest intelligence."}
+            </p>
+
+          </div>
+
         </div>
 
-        <div className="dashboard-status-right">
+        <div className="dashboard-hero-status">
 
-          <StatusDot
-            status={backendOnline}
-          />
+          <div className="dashboard-online-row">
 
-          <span>
-            {backendOnline
-              ? "Backend online"
-              : "Backend offline"}
-          </span>
+            <StatusDot
+              status={backendOnline}
+            />
+
+            <strong>
+              {backendOnline
+                ? "System Online"
+                : "Backend Offline"}
+            </strong>
+
+          </div>
 
           <code>
             {getApiBase()}
@@ -281,375 +260,504 @@ export default function Dashboard({
 
         </div>
 
-      </div>
+      </section>
 
       {/* ===================================================
-          MAIN METRICS
+          PRIMARY ACTIONS
       =================================================== */}
 
-      <div className="metrics-grid">
+      <section className="dashboard-actions">
 
-        <MetricCard
-          icon={Trees}
-          title="Trees Detected"
-          value={fmt(treeCount, 0)}
-          accent="metric-green"
-        />
+        <button
+          className="dashboard-primary-action"
+          onClick={() => setPage("image")}
+        >
 
-        <MetricCard
-          icon={TreePine}
-          title="Tree Crowns"
-          value={fmt(crownCount, 0)}
-          accent="metric-green"
-        />
+          <div className="action-icon">
+            <Upload size={23} />
+          </div>
 
-        <MetricCard
-          icon={BarChart3}
-          title="Aboveground Biomass"
-          value={displayValue(agb)}
-          unit="t"
-          accent="metric-blue"
-        />
+          <div>
+            <strong>
+              Image Analysis
+            </strong>
 
-        <MetricCard
-          icon={Leaf}
-          title="Carbon"
-          value={displayValue(carbon)}
-          unit="t C"
-          accent="metric-green"
-        />
+            <span>
+              Upload forest imagery and run AI tree,
+              crown and biomass analysis.
+            </span>
+          </div>
 
-        <MetricCard
-          icon={Activity}
-          title="Canopy Coverage"
-          value={canopyDisplay}
-          accent="metric-purple"
-        />
+          <ArrowRight size={20} />
 
-      </div>
+        </button>
+
+        <button
+          className="dashboard-secondary-action"
+          onClick={() => setPage("satellite")}
+        >
+
+          <div className="action-icon">
+            <Satellite size={23} />
+          </div>
+
+          <div>
+            <strong>
+              Explore Satellite Data
+            </strong>
+
+            <span>
+              Analyze Sentinel and GEDI
+              Earth observation data.
+            </span>
+          </div>
+
+          <ArrowRight size={20} />
+
+        </button>
+
+      </section>
 
       {/* ===================================================
-          MAIN TWO COLUMN AREA
+          INTELLIGENCE MODULES
       =================================================== */}
 
-      <div className="two-column">
+      <section>
 
-        {/* =================================================
-            LATEST ANALYSIS
-        ================================================= */}
+        <div className="dashboard-section-heading">
 
-        <div className="panel">
+          <div>
 
-          <div className="panel-head">
-
-            <div>
-              <h3>
-                Latest Analysis
-              </h3>
-
-              <p>
-                Summary of the most recent forest
-                image processed by SylvaSense.
-              </p>
+            <div className="panel-kicker">
+              INTELLIGENCE MODULES
             </div>
 
-            {hasAnalysis && (
-              <span className="badge success">
-                ANALYZED
-              </span>
-            )}
+            <h2>
+              Explore Forest Intelligence
+            </h2>
 
-          </div>
-
-          {!hasAnalysis ? (
-
-            <div className="empty-panel">
-
-              <ScanSearch size={32} />
-
-              <strong>
-                No analysis available
-              </strong>
-
-              <span>
-                Upload a forest image to generate
-                tree, crown and biomass intelligence.
-              </span>
-
-              <button
-                className="secondary-btn"
-                onClick={() =>
-                  setPage("image")
-                }
-              >
-                <ScanSearch size={17} />
-
-                Start Image Analysis
-              </button>
-
-            </div>
-
-          ) : (
-
-            <div className="analysis-summary">
-
-              <div className="summary-row">
-                <span>
-                  Trees detected
-                </span>
-
-                <strong>
-                  {fmt(treeCount, 0)}
-                </strong>
-              </div>
-
-              <div className="summary-row">
-                <span>
-                  Tree crowns
-                </span>
-
-                <strong>
-                  {fmt(crownCount, 0)}
-                </strong>
-              </div>
-
-              <div className="summary-row">
-                <span>
-                  Aboveground biomass
-                </span>
-
-                <strong>
-                  {displayValue(agb)} t
-                </strong>
-              </div>
-
-              <div className="summary-row">
-                <span>
-                  Carbon stored
-                </span>
-
-                <strong>
-                  {displayValue(carbon)} t C
-                </strong>
-              </div>
-
-              <div className="summary-row">
-                <span>
-                  CO₂ equivalent
-                </span>
-
-                <strong>
-                  {displayValue(co2e)} t
-                </strong>
-              </div>
-
-              <div className="summary-row">
-                <span>
-                  Canopy coverage
-                </span>
-
-                <strong>
-                  {canopyDisplay}
-                </strong>
-              </div>
-
-              <button
-                className="secondary-btn full"
-                onClick={() =>
-                  setPage("image")
-                }
-              >
-                <ScanSearch size={17} />
-
-                View Full Image Analysis
-              </button>
-
-            </div>
-
-          )}
-
-        </div>
-
-        {/* =================================================
-            EARTH OBSERVATION
-        ================================================= */}
-
-        <div className="panel">
-
-          <div className="panel-head">
-
-            <div>
-              <h3>
-                Earth Observation
-              </h3>
-
-              <p>
-                Explore satellite data and
-                forecasting separately.
-              </p>
-            </div>
-
-          </div>
-
-          <div className="module-list">
-
-            {/* SATELLITE */}
-
-            <button
-              className="module-item"
-              onClick={() =>
-                setPage("satellite")
-              }
-            >
-
-              <div className="module-icon">
-                <Satellite />
-              </div>
-
-              <div>
-                <strong>
-                  Satellite Intelligence
-                </strong>
-
-                <span>
-                  Sentinel-1, Sentinel-2 and GEDI
-                </span>
-              </div>
-
-              <span className="module-arrow">
-                →
-              </span>
-
-            </button>
-
-            {/* CHANGE DETECTION */}
-
-            <button
-              className="module-item"
-              onClick={() =>
-                setPage("change")
-              }
-            >
-
-              <div className="module-icon">
-                <Layers3 />
-              </div>
-
-              <div>
-                <strong>
-                  Change Detection
-                </strong>
-
-                <span>
-                  Compare forest conditions
-                  across observation periods
-                </span>
-              </div>
-
-              <span className="module-arrow">
-                →
-              </span>
-
-            </button>
-
-            {/* FORECAST */}
-
-            <button
-              className="module-item"
-              onClick={() =>
-                setPage("forecast")
-              }
-            >
-
-              <div className="module-icon">
-                <BrainCircuit />
-              </div>
-
-              <div>
-                <strong>
-                  AGB Forecast
-                </strong>
-
-                <span>
-                  Project future aboveground biomass
-                </span>
-              </div>
-
-              <span className="module-arrow">
-                →
-              </span>
-
-            </button>
+            <p>
+              Each module provides a different view of
+              your forest data.
+            </p>
 
           </div>
 
         </div>
 
-      </div>
+        <div className="dashboard-module-grid">
+
+          <ModuleCard
+            icon={ScanSearch}
+            title="Image Analysis"
+            description="Detect trees, segment crowns and estimate biomass from uploaded forest imagery."
+            status={backendOnline}
+            statusText={
+              backendOnline
+                ? "READY"
+                : "OFFLINE"
+            }
+            onClick={() =>
+              setPage("image")
+            }
+          />
+
+          <ModuleCard
+            icon={Satellite}
+            title="Satellite Intelligence"
+            description="Explore Sentinel-1, Sentinel-2, NDVI, SAR and GEDI information for a selected location."
+            status={backendOnline}
+            statusText={
+              backendOnline
+                ? "CONNECTED"
+                : "OFFLINE"
+            }
+            onClick={() =>
+              setPage("satellite")
+            }
+          />
+
+          <ModuleCard
+            icon={Layers3}
+            title="Change Detection"
+            description="Compare forest conditions between observation periods and identify vegetation changes."
+            status={backendOnline}
+            statusText={
+              backendOnline
+                ? "READY"
+                : "OFFLINE"
+            }
+            onClick={() =>
+              setPage("change")
+            }
+          />
+
+          <ModuleCard
+            icon={BrainCircuit}
+            title="AGB Forecast"
+            description="Explore aboveground biomass projections generated from the forecasting pipeline."
+            status={backendOnline}
+            statusText={
+              backendOnline
+                ? "READY"
+                : "OFFLINE"
+            }
+            onClick={() =>
+              setPage("forecast")
+            }
+          />
+
+        </div>
+
+      </section>
 
       {/* ===================================================
-          SERVICE AVAILABILITY
+          ANALYSIS WORKFLOW
       =================================================== */}
 
-      <div className="panel">
+      <section className="panel dashboard-workflow">
 
         <div className="panel-head">
 
           <div>
+
+            <div className="panel-kicker">
+              AI ANALYSIS WORKFLOW
+            </div>
+
+            <h3>
+              Forest Processing Pipeline
+            </h3>
+
+            <p>
+              The workflow used by SylvaSense to turn
+              forest imagery into measurable intelligence.
+            </p>
+
+          </div>
+
+          <span
+            className={`badge ${
+              hasAnalysis
+                ? "success"
+                : ""
+            }`}
+          >
+            {pipelineStage}
+          </span>
+
+        </div>
+
+        <div className="pipeline">
+
+          <PipelineStep
+            number="1"
+            icon={Upload}
+            title="Input Imagery"
+            description="Forest image uploaded for analysis"
+            completed={hasAnalysis}
+            active={!hasAnalysis}
+          />
+
+          <PipelineStep
+            number="2"
+            icon={ScanSearch}
+            title="Tree Detection"
+            description="AI identifies individual trees"
+            completed={
+              hasTreeDetection
+            }
+            active={
+              hasAnalysis &&
+              !hasTreeDetection
+            }
+          />
+
+          <PipelineStep
+            number="3"
+            icon={TreePine}
+            title="Crown Segmentation"
+            description="Tree crown boundaries are extracted"
+            completed={
+              !!hasCrownSegmentation
+            }
+            active={
+              hasTreeDetection &&
+              !hasCrownSegmentation
+            }
+          />
+
+          <PipelineStep
+            number="4"
+            icon={BarChart3}
+            title="Biomass Estimation"
+            description="Aboveground biomass and carbon are calculated"
+            completed={
+              !!hasBiomass
+            }
+            active={
+              hasCrownSegmentation &&
+              !hasBiomass
+            }
+          />
+
+          <PipelineStep
+            number="5"
+            icon={BrainCircuit}
+            title="Forest Intelligence"
+            description="Results become available across the dashboard"
+            completed={
+              hasAnalysis &&
+              !!hasBiomass
+            }
+            active={
+              hasBiomass &&
+              hasAnalysis
+            }
+          />
+
+        </div>
+
+      </section>
+
+      {/* ===================================================
+          ANALYSIS STATE
+      =================================================== */}
+
+      <section className="dashboard-status-grid">
+
+        <div className="panel dashboard-status-card">
+
+          <div className="status-card-icon">
+            <Activity size={23} />
+          </div>
+
+          <div>
+
+            <div className="panel-kicker">
+              LATEST ACTIVITY
+            </div>
+
+            <h3>
+              {hasAnalysis
+                ? "Analysis available"
+                : "No analysis yet"}
+            </h3>
+
+            <p>
+              {hasAnalysis
+                ? "Your latest forest analysis can be opened from the Image Analysis module."
+                : "Run an image analysis to populate your forest intelligence results."}
+            </p>
+
+          </div>
+
+          {hasAnalysis && (
+            <button
+              className="text-action"
+              onClick={() =>
+                setPage("image")
+              }
+            >
+              View
+              <ArrowRight size={16} />
+            </button>
+          )}
+
+        </div>
+
+        <div className="panel dashboard-status-card">
+
+          <div className="status-card-icon">
+            <Map size={23} />
+          </div>
+
+          <div>
+
+            <div className="panel-kicker">
+              EARTH OBSERVATION
+            </div>
+
+            <h3>
+              Satellite services
+            </h3>
+
+            <p>
+              Access Sentinel imagery, spectral
+              layers, SAR information and GEDI
+              observations.
+            </p>
+
+          </div>
+
+          <button
+            className="text-action"
+            onClick={() =>
+              setPage("satellite")
+            }
+          >
+            Explore
+            <ArrowRight size={16} />
+          </button>
+
+        </div>
+
+      </section>
+
+      {/* ===================================================
+          SERVICE STATUS
+      =================================================== */}
+
+      <section className="panel dashboard-services">
+
+        <div className="panel-head">
+
+          <div>
+
+            <div className="panel-kicker">
+              PLATFORM STATUS
+            </div>
+
             <h3>
               Service Availability
             </h3>
 
             <p>
-              Current connection state of the
-              SylvaSense analysis pipeline.
+              Current state of the connected
+              SylvaSense services.
             </p>
+
           </div>
 
         </div>
 
-        <div className="availability-grid">
+        <div className="dashboard-service-grid">
 
-          <Availability
-            status={backendOnline}
-            label="FastAPI"
-          />
+          <div className="dashboard-service">
 
-          <Availability
-            status={backendOnline}
-            label="Image Analysis"
-          />
+            <StatusDot
+              status={backendOnline}
+            />
 
-          <Availability
-            status={backendOnline}
-            label="Satellite Analysis"
-          />
+            <div>
+              <strong>
+                FastAPI
+              </strong>
 
-          <Availability
-            status={backendOnline}
-            label="Earth Engine"
-          />
+              <span>
+                Core backend
+              </span>
+            </div>
+
+            <b>
+              {backendOnline
+                ? "READY"
+                : "OFFLINE"}
+            </b>
+
+          </div>
+
+          <div className="dashboard-service">
+
+            <StatusDot
+              status={backendOnline}
+            />
+
+            <div>
+              <strong>
+                AI Analysis
+              </strong>
+
+              <span>
+                Tree and biomass pipeline
+              </span>
+            </div>
+
+            <b>
+              {backendOnline
+                ? "READY"
+                : "OFFLINE"}
+            </b>
+
+          </div>
+
+          <div className="dashboard-service">
+
+            <StatusDot
+              status={backendOnline}
+            />
+
+            <div>
+              <strong>
+                Earth Engine
+              </strong>
+
+              <span>
+                Satellite processing
+              </span>
+            </div>
+
+            <b>
+              {backendOnline
+                ? "READY"
+                : "OFFLINE"}
+            </b>
+
+          </div>
+
+          <div className="dashboard-service">
+
+            <StatusDot
+              status={backendOnline}
+            />
+
+            <div>
+              <strong>
+                Remote Sensing
+              </strong>
+
+              <span>
+                Sentinel and GEDI services
+              </span>
+            </div>
+
+            <b>
+              {backendOnline
+                ? "READY"
+                : "OFFLINE"}
+            </b>
+
+          </div>
 
         </div>
 
-      </div>
+      </section>
 
       {/* ===================================================
-          DATA NOTICE
+          FOOTER NOTICE
       =================================================== */}
 
       <div className="notice">
 
-        <BrainCircuit size={19} />
+        <Clock3 size={18} />
 
         <span>
-          Dashboard metrics are read from the latest
-          backend analysis response. SylvaSense does
-          not generate replacement tree, biomass,
-          carbon or canopy values on the frontend.
+          The Dashboard is an overview and navigation
+          center. Detailed tree detection, crown
+          segmentation, biomass, satellite imagery,
+          change detection and forecasting results are
+          available inside their respective modules.
         </span>
 
       </div>
     </>
   );
+}
+
+/* =========================================================
+   HEADER ICON
+========================================================= */
+
+function GaugeIcon(props) {
+  return <BarChart3 {...props} />;
 }
