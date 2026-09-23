@@ -9,6 +9,7 @@ matplotlib
 scikit-learn
 scikit-image
 pytorch-lightning
+omegaconf
 earthengine-api
 geopandas
 shapely
