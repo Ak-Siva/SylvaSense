@@ -20,6 +20,8 @@ import math
 import base64
 import urllib.request
 import threading
+import json
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -57,6 +59,142 @@ app.add_middleware(
 
 
 # ============================================================
+# JOB STORAGE
+#
+# In-memory storage is kept for fast access.
+#
+# A JSON file is also used so that job information survives
+# accidental application reloads/restarts during the lifetime
+# of the Render instance.
+# ============================================================
+
+_image_jobs = {}
+
+_image_jobs_lock = threading.Lock()
+
+JOB_STORAGE_DIR = Path(
+    os.getenv(
+        "SYLVASENSE_JOB_DIR",
+        "/tmp/sylvasense_jobs",
+    )
+)
+
+JOB_STORAGE_FILE = (
+    JOB_STORAGE_DIR / "image_jobs.json"
+)
+
+
+def ensure_job_storage():
+    try:
+        JOB_STORAGE_DIR.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+    except Exception as exc:
+
+        print(
+            "Job storage directory creation failed:"
+        )
+
+        print(exc)
+
+
+def load_persisted_jobs():
+
+    ensure_job_storage()
+
+    if not JOB_STORAGE_FILE.exists():
+        return
+
+    try:
+
+        with open(
+            JOB_STORAGE_FILE,
+            "r",
+            encoding="utf-8",
+        ) as file:
+
+            data = json.load(file)
+
+        if not isinstance(
+            data,
+            dict,
+        ):
+            return
+
+        with _image_jobs_lock:
+
+            for job_id, job in data.items():
+
+                if isinstance(
+                    job,
+                    dict,
+                ):
+
+                    _image_jobs[
+                        job_id
+                    ] = job
+
+    except Exception as exc:
+
+        print(
+            "Could not load persisted image jobs:"
+        )
+
+        print(exc)
+
+
+def save_persisted_jobs():
+
+    ensure_job_storage()
+
+    try:
+
+        with _image_jobs_lock:
+
+            snapshot = dict(
+                _image_jobs
+            )
+
+        temporary_file = (
+            JOB_STORAGE_FILE.with_suffix(
+                ".tmp"
+            )
+        )
+
+        with open(
+            temporary_file,
+            "w",
+            encoding="utf-8",
+        ) as file:
+
+            json.dump(
+                snapshot,
+                file,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+
+        os.replace(
+            temporary_file,
+            JOB_STORAGE_FILE,
+        )
+
+    except Exception as exc:
+
+        print(
+            "Could not persist image jobs:"
+        )
+
+        print(exc)
+
+
+# Load any jobs available from this process/container.
+load_persisted_jobs()
+
+
+# ============================================================
 # DEEPFOREST MODEL
 #
 # IMPORTANT:
@@ -66,41 +204,66 @@ app.add_middleware(
 
 @lru_cache(maxsize=1)
 def get_deepforest_model():
+
     from tree_detection import load_model
 
     return load_model()
 
 
 # ============================================================
-# IMAGE ANALYSIS JOB STORAGE
-#
-# Each uploaded image receives a job_id.
-#
-# The frontend polls:
-#
-# GET /api/image-analysis-progress/{job_id}
-#
+# IMAGE ANALYSIS JOB HELPERS
 # ============================================================
 
-_image_jobs = {}
+def create_image_job(
+    filename,
+):
 
-_image_jobs_lock = threading.Lock()
-
-
-def create_image_job(filename):
     job_id = uuid.uuid4().hex
 
+    job = {
+
+        "job_id":
+            job_id,
+
+        "filename":
+            filename,
+
+        "status":
+            "queued",
+
+        "progress":
+            0,
+
+        "stage":
+            "Queued",
+
+        "message":
+            "Image analysis is queued.",
+
+        "result":
+            None,
+
+        "error":
+            None,
+
+        "created_at":
+            datetime.now(
+                timezone.utc
+            ).isoformat(),
+
+        "updated_at":
+            datetime.now(
+                timezone.utc
+            ).isoformat(),
+    }
+
     with _image_jobs_lock:
-        _image_jobs[job_id] = {
-            "job_id": job_id,
-            "filename": filename,
-            "status": "queued",
-            "progress": 0,
-            "stage": "Queued",
-            "message": "Image analysis is queued.",
-            "result": None,
-            "error": None,
-        }
+
+        _image_jobs[
+            job_id
+        ] = job
+
+    save_persisted_jobs()
 
     return job_id
 
@@ -111,9 +274,12 @@ def update_image_job(
     stage,
     message,
 ):
+
     with _image_jobs_lock:
 
-        job = _image_jobs.get(job_id)
+        job = _image_jobs.get(
+            job_id
+        )
 
         if job is None:
             return
@@ -133,48 +299,148 @@ def update_image_job(
         job["message"] = message
 
         if progress >= 100:
-            job["status"] = "completed"
+
+            job["status"] = (
+                "completed"
+            )
 
         elif progress > 0:
-            job["status"] = "running"
+
+            job["status"] = (
+                "running"
+            )
+
+        job["updated_at"] = (
+            datetime.now(
+                timezone.utc
+            ).isoformat()
+        )
+
+    save_persisted_jobs()
 
 
 def complete_image_job(
     job_id,
     result,
 ):
+
     with _image_jobs_lock:
 
-        job = _image_jobs.get(job_id)
+        job = _image_jobs.get(
+            job_id
+        )
 
         if job is None:
             return
 
         job["progress"] = 100
-        job["status"] = "completed"
-        job["stage"] = "Complete"
+
+        job["status"] = (
+            "completed"
+        )
+
+        job["stage"] = (
+            "Complete"
+        )
+
         job["message"] = (
             "Image analysis completed successfully."
         )
+
         job["result"] = result
+
         job["error"] = None
+
+        job["updated_at"] = (
+            datetime.now(
+                timezone.utc
+            ).isoformat()
+        )
+
+    save_persisted_jobs()
 
 
 def fail_image_job(
     job_id,
     error,
 ):
+
     with _image_jobs_lock:
 
-        job = _image_jobs.get(job_id)
+        job = _image_jobs.get(
+            job_id
+        )
 
         if job is None:
-            return
 
-        job["status"] = "failed"
-        job["stage"] = "Failed"
-        job["message"] = str(error)
-        job["error"] = str(error)
+            # The process may have restarted and
+            # the original job may not be available.
+            # Recreate a failure record so the frontend
+            # receives a useful response.
+            _image_jobs[
+                job_id
+            ] = {
+
+                "job_id":
+                    job_id,
+
+                "filename":
+                    "unknown",
+
+                "status":
+                    "failed",
+
+                "progress":
+                    0,
+
+                "stage":
+                    "Failed",
+
+                "message":
+                    str(error),
+
+                "result":
+                    None,
+
+                "error":
+                    str(error),
+
+                "created_at":
+                    datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+
+                "updated_at":
+                    datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+            }
+
+        else:
+
+            job["status"] = (
+                "failed"
+            )
+
+            job["stage"] = (
+                "Failed"
+            )
+
+            job["message"] = (
+                str(error)
+            )
+
+            job["error"] = (
+                str(error)
+            )
+
+            job["updated_at"] = (
+                datetime.now(
+                    timezone.utc
+                ).isoformat()
+            )
+
+    save_persisted_jobs()
 
 
 # ============================================================
@@ -326,7 +592,9 @@ def make_json_safe(obj):
 # IMAGE VALIDATION
 # ============================================================
 
-def validate_image(filename):
+def validate_image(
+    filename,
+):
 
     suffix = Path(
         filename or ""
@@ -401,13 +669,16 @@ def initialize_earth_engine():
 # SENTINEL-2 CLOUD MASK
 # ============================================================
 
-def mask_s2_clouds_satellite(image):
+def mask_s2_clouds_satellite(
+    image,
+):
 
     qa = image.select(
         "QA60"
     )
 
     cloud_bit_mask = 1 << 10
+
     cirrus_bit_mask = 1 << 11
 
     mask = (
@@ -481,18 +752,39 @@ def get_sentinel2_rgb_image(
     if scene_count == 0:
 
         return {
-            "available": False,
-            "scene_count": 0,
-            "url": None,
-            "data_url": None,
-            "date": None,
-            "cloud_percentage": None,
-            "scene_id": None,
+
+            "available":
+                False,
+
+            "scene_count":
+                0,
+
+            "url":
+                None,
+
+            "data_url":
+                None,
+
+            "date":
+                None,
+
+            "cloud_percentage":
+                None,
+
+            "scene_id":
+                None,
+
             "center": {
-                "latitude": latitude,
-                "longitude": longitude,
+
+                "latitude":
+                    latitude,
+
+                "longitude":
+                    longitude,
             },
-            "radius_m": radius_m,
+
+            "radius_m":
+                radius_m,
         }
 
     image = ee.Image(
@@ -503,7 +795,9 @@ def get_sentinel2_rgb_image(
         ee.ImageCollection(
             "COPERNICUS/S2_SR_HARMONIZED"
         )
-        .filterBounds(selected_point)
+        .filterBounds(
+            selected_point
+        )
         .filterDate(
             start_date,
             end_date,
@@ -526,33 +820,61 @@ def get_sentinel2_rgb_image(
     if intersection_count == 0:
 
         return {
-            "available": False,
-            "scene_count": 0,
-            "url": None,
-            "data_url": None,
-            "date": None,
-            "cloud_percentage": None,
-            "scene_id": None,
+
+            "available":
+                False,
+
+            "scene_count":
+                0,
+
+            "url":
+                None,
+
+            "data_url":
+                None,
+
+            "date":
+                None,
+
+            "cloud_percentage":
+                None,
+
+            "scene_id":
+                None,
+
             "center": {
-                "latitude": latitude,
-                "longitude": longitude,
+
+                "latitude":
+                    latitude,
+
+                "longitude":
+                    longitude,
             },
-            "radius_m": radius_m,
+
+            "radius_m":
+                radius_m,
         }
 
-    image_info = image.getInfo() or {}
+    image_info = (
+        image.getInfo()
+        or {}
+    )
 
-    properties = image_info.get(
-        "properties",
-        {}
+    properties = (
+        image_info.get(
+            "properties",
+            {},
+        )
     )
 
     scene_id = properties.get(
         "PRODUCT_ID"
     )
 
-    acquisition_millis = properties.get(
-        "system:time_start"
+    acquisition_millis = (
+        properties.get(
+            "system:time_start"
+        )
     )
 
     acquisition_date = None
@@ -561,22 +883,23 @@ def get_sentinel2_rgb_image(
 
         try:
 
-            from datetime import datetime, timezone
-
             acquisition_date = (
                 datetime.fromtimestamp(
                     acquisition_millis / 1000,
                     tz=timezone.utc,
+                ).strftime(
+                    "%Y-%m-%d"
                 )
-                .strftime("%Y-%m-%d")
             )
 
         except Exception:
 
             acquisition_date = None
 
-    cloud_percentage = properties.get(
-        "CLOUDY_PIXEL_PERCENTAGE"
+    cloud_percentage = (
+        properties.get(
+            "CLOUDY_PIXEL_PERCENTAGE"
+        )
     )
 
     masked_image = (
@@ -591,22 +914,38 @@ def get_sentinel2_rgb_image(
     )
 
     visualization = {
+
         "bands": [
             "B4",
             "B3",
             "B2",
         ],
-        "min": 0.0,
-        "max": 0.3,
+
+        "min":
+            0.0,
+
+        "max":
+            0.3,
     }
 
-    region_info = region.getInfo()
+    region_info = (
+        region.getInfo()
+    )
 
     thumbnail_params = {
-        "region": region,
-        "dimensions": 1024,
-        "format": "png",
-        "crs": "EPSG:4326",
+
+        "region":
+            region,
+
+        "dimensions":
+            1024,
+
+        "format":
+            "png",
+
+        "crs":
+            "EPSG:4326",
+
         **visualization,
     }
 
@@ -618,6 +957,7 @@ def get_sentinel2_rgb_image(
     )
 
     data_url = None
+
     image_size_bytes = None
 
     try:
@@ -635,10 +975,12 @@ def get_sentinel2_rgb_image(
             timeout=60,
         ) as response:
 
-            image_bytes = response.read()
+            image_bytes = (
+                response.read()
+            )
 
-        image_size_bytes = len(
-            image_bytes
+        image_size_bytes = (
+            len(image_bytes)
         )
 
         if not image_bytes:
@@ -665,7 +1007,9 @@ def get_sentinel2_rgb_image(
             "Satellite thumbnail download failed:"
         )
 
-        print(download_error)
+        print(
+            download_error
+        )
 
         data_url = None
 
@@ -714,15 +1058,19 @@ def get_sentinel2_rgb_image(
             radius_m,
 
         "center": {
+
             "latitude":
                 latitude,
+
             "longitude":
                 longitude,
         },
 
         "selected_location": {
+
             "latitude":
                 latitude,
+
             "longitude":
                 longitude,
         },
@@ -749,8 +1097,6 @@ def get_sentinel2_rgb_image(
 
 # ============================================================
 # IMAGE ANALYSIS BACKGROUND JOB
-#
-# Heavy modules are imported INSIDE this function.
 # ============================================================
 
 def run_image_analysis_job(
@@ -762,7 +1108,7 @@ def run_image_analysis_job(
     try:
 
         # ----------------------------------------------------
-        # LAZY IMPORTS
+        # IMPORT HEAVY MODULES ONLY WHEN REQUIRED
         # ----------------------------------------------------
 
         from tree_detection import (
@@ -779,7 +1125,7 @@ def run_image_analysis_job(
         )
 
         # ----------------------------------------------------
-        # 5% - FILE READY
+        # FILE READY
         # ----------------------------------------------------
 
         update_image_job(
@@ -790,7 +1136,7 @@ def run_image_analysis_job(
         )
 
         # ----------------------------------------------------
-        # 10% - LOADING MODEL
+        # MODEL LOADING
         # ----------------------------------------------------
 
         update_image_job(
@@ -800,11 +1146,9 @@ def run_image_analysis_job(
             "Loading the DeepForest tree detection model...",
         )
 
-        model = get_deepforest_model()
-
-        # ----------------------------------------------------
-        # 15% - MODEL READY
-        # ----------------------------------------------------
+        model = (
+            get_deepforest_model()
+        )
 
         update_image_job(
             job_id,
@@ -814,7 +1158,7 @@ def run_image_analysis_job(
         )
 
         # ----------------------------------------------------
-        # 20% - TREE DETECTION START
+        # TREE DETECTION
         # ----------------------------------------------------
 
         update_image_job(
@@ -832,12 +1176,16 @@ def run_image_analysis_job(
             iou_threshold=0.15,
         )
 
-        predictions = compute_crown_metrics(
-            predictions,
-            pixel_size_m=0.1,
+        predictions = (
+            compute_crown_metrics(
+                predictions,
+                pixel_size_m=0.1,
+            )
         )
 
-        tree_count = len(predictions)
+        tree_count = len(
+            predictions
+        )
 
         # ----------------------------------------------------
         # LOG DETECTED BOXES
@@ -882,10 +1230,6 @@ def run_image_analysis_job(
             "=========================================\n"
         )
 
-        # ----------------------------------------------------
-        # 50% - TREE DETECTION COMPLETE
-        # ----------------------------------------------------
-
         update_image_job(
             job_id,
             50,
@@ -894,7 +1238,7 @@ def run_image_analysis_job(
         )
 
         # ----------------------------------------------------
-        # 55% - CROWN SEGMENTATION START
+        # CROWN SEGMENTATION
         # ----------------------------------------------------
 
         update_image_job(
@@ -911,10 +1255,6 @@ def run_image_analysis_job(
             )
         )
 
-        # ----------------------------------------------------
-        # 70% - CROWN SEGMENTATION COMPLETE
-        # ----------------------------------------------------
-
         update_image_job(
             job_id,
             70,
@@ -923,7 +1263,7 @@ def run_image_analysis_job(
         )
 
         # ----------------------------------------------------
-        # 75% - BIOMASS START
+        # BIOMASS
         # ----------------------------------------------------
 
         update_image_job(
@@ -933,33 +1273,39 @@ def run_image_analysis_job(
             "Calculating aboveground biomass...",
         )
 
-        # ----------------------------------------------------
-        # EMPTY TREE RESULT
-        # ----------------------------------------------------
-
         if predictions.empty:
 
             biomass_result = {
-                "status": "success",
-                "tree_count": 0,
-                "total_agb_tonnes": 0.0,
-                "total_carbon_tonnes": 0.0,
-                "total_co2e_tonnes": 0.0,
-                "trees": [],
-            }
 
-        # ----------------------------------------------------
-        # BIOMASS CALCULATION
-        # ----------------------------------------------------
+                "status":
+                    "success",
+
+                "tree_count":
+                    0,
+
+                "total_agb_tonnes":
+                    0.0,
+
+                "total_carbon_tonnes":
+                    0.0,
+
+                "total_co2e_tonnes":
+                    0.0,
+
+                "trees":
+                    [],
+            }
 
         else:
 
-            df = per_tree_biomass_pipeline(
-                predictions,
-                wood_density_g_cm3=0.6,
-                crown_diameter_column=(
-                    "crown_diameter_m"
-                ),
+            df = (
+                per_tree_biomass_pipeline(
+                    predictions,
+                    wood_density_g_cm3=0.6,
+                    crown_diameter_column=(
+                        "crown_diameter_m"
+                    ),
+                )
             )
 
             trees = []
@@ -969,6 +1315,7 @@ def run_image_analysis_job(
                 trees.append(
                     make_json_safe(
                         {
+
                             "tree_id":
                                 int(i) + 1,
 
@@ -1053,10 +1400,6 @@ def run_image_analysis_job(
                     trees,
             }
 
-        # ----------------------------------------------------
-        # 90% - BIOMASS COMPLETE
-        # ----------------------------------------------------
-
         update_image_job(
             job_id,
             90,
@@ -1065,7 +1408,7 @@ def run_image_analysis_job(
         )
 
         # ----------------------------------------------------
-        # 95% - PREPARING RESPONSE
+        # PREPARE RESPONSE
         # ----------------------------------------------------
 
         update_image_job(
@@ -1074,10 +1417,6 @@ def run_image_analysis_job(
             "Preparing results",
             "Preparing final analysis results...",
         )
-
-        # ----------------------------------------------------
-        # FINAL RESPONSE
-        # ----------------------------------------------------
 
         response = {
 
@@ -1124,10 +1463,6 @@ def run_image_analysis_job(
             response
         )
 
-        # ----------------------------------------------------
-        # 100% - COMPLETE
-        # ----------------------------------------------------
-
         complete_image_job(
             job_id,
             response,
@@ -1155,7 +1490,10 @@ def run_image_analysis_job(
         ):
 
             try:
-                os.remove(temp_path)
+
+                os.remove(
+                    temp_path
+                )
 
             except Exception:
                 pass
@@ -1169,6 +1507,7 @@ def run_image_analysis_job(
 def root():
 
     return {
+
         "service":
             "SYLVASENSE backend",
 
@@ -1245,8 +1584,6 @@ def health():
 
 # ============================================================
 # IMAGE ANALYSIS
-#
-# START JOB
 # ============================================================
 
 @app.post(
@@ -1290,6 +1627,7 @@ async def image_analyze(
         ) as temp:
 
             temp.write(data)
+
             temp_path = temp.name
 
         job_id = create_image_job(
@@ -1334,7 +1672,10 @@ async def image_analyze(
         ):
 
             try:
-                os.remove(temp_path)
+
+                os.remove(
+                    temp_path
+                )
 
             except Exception:
                 pass
@@ -1369,41 +1710,71 @@ def image_analysis_progress(
 
             raise HTTPException(
                 status_code=404,
-                detail="Analysis job not found.",
+                detail=(
+                    "Analysis job not found. "
+                    "The backend process may have restarted "
+                    "while the analysis was running."
+                ),
             )
 
-        return {
+        return make_json_safe(
+            {
+                "job_id":
+                    job.get(
+                        "job_id"
+                    ),
 
-            "job_id":
-                job["job_id"],
+                "filename":
+                    job.get(
+                        "filename"
+                    ),
 
-            "filename":
-                job["filename"],
+                "status":
+                    job.get(
+                        "status"
+                    ),
 
-            "status":
-                job["status"],
+                "progress":
+                    job.get(
+                        "progress",
+                        0,
+                    ),
 
-            "progress":
-                job["progress"],
+                "stage":
+                    job.get(
+                        "stage"
+                    ),
 
-            "stage":
-                job["stage"],
+                "message":
+                    job.get(
+                        "message"
+                    ),
 
-            "message":
-                job["message"],
+                "result":
+                    job.get(
+                        "result"
+                    ),
 
-            "result":
-                job["result"],
+                "error":
+                    job.get(
+                        "error"
+                    ),
 
-            "error":
-                job["error"],
-        }
+                "created_at":
+                    job.get(
+                        "created_at"
+                    ),
+
+                "updated_at":
+                    job.get(
+                        "updated_at"
+                    ),
+            }
+        )
 
 
 # ============================================================
 # TREE DETECTION
-#
-# Kept as an alias for compatibility.
 # ============================================================
 
 @app.post(
@@ -1424,7 +1795,9 @@ async def tree_detection(
 # FORECAST REQUEST
 # ============================================================
 
-class ForecastRequest(BaseModel):
+class ForecastRequest(
+    BaseModel
+):
 
     historical_years: list[float] = Field(
         ...,
@@ -1443,7 +1816,7 @@ class ForecastRequest(BaseModel):
 
 
 # ============================================================
-# OLD AGB FORECAST ENDPOINT
+# AGB FORECAST
 # ============================================================
 
 @app.post(
@@ -1468,7 +1841,6 @@ def forecast(
 
     try:
 
-        # Lazy import
         from agb_forecasting import (
             forecast_agb,
             calculate_forecast_summary,
@@ -1480,12 +1852,15 @@ def forecast(
             req.forecast_years,
         )
 
-        summary = calculate_forecast_summary(
-            result
+        summary = (
+            calculate_forecast_summary(
+                result
+            )
         )
 
         return make_json_safe(
             {
+
                 "status":
                     "success",
 
@@ -1498,6 +1873,8 @@ def forecast(
         )
 
     except Exception as exc:
+
+        traceback.print_exc()
 
         raise HTTPException(
             status_code=500,
@@ -1512,7 +1889,9 @@ def forecast(
 # SATELLITE ANALYSIS REQUEST
 # ============================================================
 
-class SatelliteAnalysisRequest(BaseModel):
+class SatelliteAnalysisRequest(
+    BaseModel
+):
 
     latitude: float = Field(
         ...,
@@ -1542,9 +1921,13 @@ class SatelliteAnalysisRequest(BaseModel):
         le=100,
     )
 
-    gedi_start_date: str = "2019-03-25"
+    gedi_start_date: str = (
+        "2019-03-25"
+    )
 
-    gedi_end_date: str = "2024-11-30"
+    gedi_end_date: str = (
+        "2024-11-30"
+    )
 
     include_sar: bool = True
 
@@ -1584,10 +1967,6 @@ def satellite_analysis(
 
     try:
 
-        # ----------------------------------------------------
-        # LAZY IMPORTS
-        # ----------------------------------------------------
-
         from spectral_layers import (
             get_layer_images,
             SPECTRAL_VIS,
@@ -1598,18 +1977,16 @@ def satellite_analysis(
             gedi_statistics,
         )
 
-        # ----------------------------------------------------
-        # EARTH ENGINE
-        # ----------------------------------------------------
-
         gee_project = (
             initialize_earth_engine()
         )
 
-        region = build_satellite_region(
-            latitude=req.latitude,
-            longitude=req.longitude,
-            radius_m=req.radius_m,
+        region = (
+            build_satellite_region(
+                latitude=req.latitude,
+                longitude=req.longitude,
+                radius_m=req.radius_m,
+            )
         )
 
         satellite_image = (
@@ -1624,11 +2001,13 @@ def satellite_analysis(
             )
         )
 
-        satellite_data = get_layer_images(
-            region=region,
-            start_date=req.start_date,
-            end_date=req.end_date,
-            max_cloud_pct=req.max_cloud_pct,
+        satellite_data = (
+            get_layer_images(
+                region=region,
+                start_date=req.start_date,
+                end_date=req.end_date,
+                max_cloud_pct=req.max_cloud_pct,
+            )
         )
 
         optical = satellite_data[
@@ -1645,7 +2024,9 @@ def satellite_analysis(
 
         layers = []
 
-        for name, params in SPECTRAL_VIS.items():
+        for name, params in (
+            SPECTRAL_VIS.items()
+        ):
 
             if (
                 name.startswith("SAR")
@@ -1744,11 +2125,9 @@ def satellite_analysis(
                     },
             }
 
-            layers.append(layer)
-
-        # ----------------------------------------------------
-        # GEDI RH98
-        # ----------------------------------------------------
+            layers.append(
+                layer
+            )
 
         gedi_image, gedi_count = (
             get_gedi_rh98(
@@ -1758,10 +2137,12 @@ def satellite_analysis(
             )
         )
 
-        gedi_stats = gedi_statistics(
-            region=region,
-            start_date=req.gedi_start_date,
-            end_date=req.gedi_end_date,
+        gedi_stats = (
+            gedi_statistics(
+                region=region,
+                start_date=req.gedi_start_date,
+                end_date=req.gedi_end_date,
+            )
         )
 
         gedi_vis = {
@@ -2029,11 +2410,17 @@ def satellite_analysis(
 # CHANGE DETECTION REQUEST
 # ============================================================
 
-class ChangeDetectionRequest(BaseModel):
+class ChangeDetectionRequest(
+    BaseModel
+):
 
-    before_date: str = "2025-06-01"
+    before_date: str = (
+        "2025-06-01"
+    )
 
-    after_date: str = "2026-02-28"
+    after_date: str = (
+        "2026-02-28"
+    )
 
     latitude: float = Field(
         10.1,
@@ -2077,7 +2464,10 @@ def change_detection(
     req: ChangeDetectionRequest,
 ):
 
-    if req.before_date >= req.after_date:
+    if (
+        req.before_date
+        >= req.after_date
+    ):
 
         raise HTTPException(
             status_code=400,
@@ -2093,17 +2483,21 @@ def change_detection(
             initialize_earth_engine()
         )
 
-        region = build_satellite_region(
-            latitude=req.latitude,
-            longitude=req.longitude,
-            radius_m=req.radius_m,
+        region = (
+            build_satellite_region(
+                latitude=req.latitude,
+                longitude=req.longitude,
+                radius_m=req.radius_m,
+            )
         )
 
         collection = (
             ee.ImageCollection(
                 "COPERNICUS/S2_SR_HARMONIZED"
             )
-            .filterBounds(region)
+            .filterBounds(
+                region
+            )
             .filter(
                 ee.Filter.lte(
                     "CLOUDY_PIXEL_PERCENTAGE",
@@ -2202,7 +2596,9 @@ def change_detection(
                 ),
             )
 
-        def add_ndvi(image):
+        def add_ndvi(
+            image,
+        ):
 
             ndvi = (
                 image
@@ -2248,8 +2644,13 @@ def change_detection(
             .clip(region)
         )
 
-        decrease_threshold = -0.15
-        increase_threshold = 0.15
+        decrease_threshold = (
+            -0.15
+        )
+
+        increase_threshold = (
+            0.15
+        )
 
         statistics = (
             ndvi_change
@@ -2257,7 +2658,9 @@ def change_detection(
                 reducer=(
                     ee.Reducer.mean()
                     .combine(
-                        reducer2=ee.Reducer.minMax(),
+                        reducer2=(
+                            ee.Reducer.minMax()
+                        ),
                         sharedInputs=True,
                     )
                 ),
@@ -2309,7 +2712,9 @@ def change_detection(
         decrease_result = (
             decrease_mask
             .reduceRegion(
-                reducer=ee.Reducer.count(),
+                reducer=(
+                    ee.Reducer.count()
+                ),
                 geometry=region,
                 scale=10,
                 maxPixels=1_000_000,
@@ -2331,7 +2736,9 @@ def change_detection(
         increase_result = (
             increase_mask
             .reduceRegion(
-                reducer=ee.Reducer.count(),
+                reducer=(
+                    ee.Reducer.count()
+                ),
                 geometry=region,
                 scale=10,
                 maxPixels=1_000_000,
@@ -2667,7 +3074,9 @@ def change_detection(
 # SATELLITE AGB REQUEST
 # ============================================================
 
-class SatelliteAGBRequest(BaseModel):
+class SatelliteAGBRequest(
+    BaseModel
+):
 
     latitude: float = Field(
         ...,
@@ -2704,13 +3113,16 @@ class SatelliteAGBRequest(BaseModel):
 # SENTINEL-2 CLOUD MASK FOR AGB
 # ============================================================
 
-def mask_s2_clouds_agb(image):
+def mask_s2_clouds_agb(
+    image,
+):
 
     qa = image.select(
         "QA60"
     )
 
     cloud_bit_mask = 1 << 10
+
     cirrus_bit_mask = 1 << 11
 
     mask = (
@@ -2742,16 +3154,20 @@ def get_yearly_gedi_agbd(
     year,
 ):
 
-    start_date = ee.Date.fromYMD(
-        year,
-        1,
-        1,
+    start_date = (
+        ee.Date.fromYMD(
+            year,
+            1,
+            1,
+        )
     )
 
-    end_date = ee.Date.fromYMD(
-        year + 1,
-        1,
-        1,
+    end_date = (
+        ee.Date.fromYMD(
+            year + 1,
+            1,
+            1,
+        )
     )
 
     collection = (
@@ -2810,7 +3226,9 @@ def get_yearly_gedi_agbd(
                 ),
         }
 
-    def quality_mask(image):
+    def quality_mask(
+        image,
+    ):
 
         l4_quality = (
             image
@@ -2857,7 +3275,9 @@ def get_yearly_gedi_agbd(
 
         projection = (
             first_image
-            .select("agbd")
+            .select(
+                "agbd"
+            )
             .projection()
         )
 
@@ -3014,20 +3434,28 @@ def get_yearly_gedi_agbd(
         or {}
     )
 
-    agbd_mean = stats.get(
-        "agbd_mean"
+    agbd_mean = (
+        stats.get(
+            "agbd_mean"
+        )
     )
 
-    agbd_median = stats.get(
-        "agbd_median"
+    agbd_median = (
+        stats.get(
+            "agbd_median"
+        )
     )
 
-    agbd_min = stats.get(
-        "agbd_min"
+    agbd_min = (
+        stats.get(
+            "agbd_min"
+        )
     )
 
-    agbd_max = stats.get(
-        "agbd_max"
+    agbd_max = (
+        stats.get(
+            "agbd_max"
+        )
     )
 
     try:
@@ -3170,8 +3598,11 @@ def find_gedi_year_result(
     search_radii = []
 
     candidates = [
+
         requested_radius_m,
+
         requested_radius_m * 2,
+
         5000,
     ]
 
@@ -3200,18 +3631,24 @@ def find_gedi_year_result(
 
     for radius in search_radii:
 
-        region = build_satellite_region(
-            latitude=latitude,
-            longitude=longitude,
-            radius_m=radius,
+        region = (
+            build_satellite_region(
+                latitude=latitude,
+                longitude=longitude,
+                radius_m=radius,
+            )
         )
 
-        result = get_yearly_gedi_agbd(
-            region=region,
-            year=year,
+        result = (
+            get_yearly_gedi_agbd(
+                region=region,
+                year=year,
+            )
         )
 
-        if result.get("available"):
+        if result.get(
+            "available"
+        ):
 
             result[
                 "search_radius_m"
@@ -3240,16 +3677,20 @@ def get_yearly_sentinel_rgb(
     max_cloud_pct,
 ):
 
-    start_date = ee.Date.fromYMD(
-        year,
-        1,
-        1,
+    start_date = (
+        ee.Date.fromYMD(
+            year,
+            1,
+            1,
+        )
     )
 
-    end_date = ee.Date.fromYMD(
-        year + 1,
-        1,
-        1,
+    end_date = (
+        ee.Date.fromYMD(
+            year + 1,
+            1,
+            1,
+        )
     )
 
     collection = (
@@ -3295,7 +3736,9 @@ def get_yearly_sentinel_rgb(
     composite = (
         collection
         .median()
-        .clip(region)
+        .clip(
+            region
+        )
     )
 
     visualization = {
@@ -3364,6 +3807,7 @@ def satellite_agb_analysis(
         historical = []
 
         search_radius_by_year = {}
+
         search_region_by_year = {}
 
         for current_year in range(
@@ -3415,9 +3859,9 @@ def satellite_agb_analysis(
 
                     "reason":
                         (
-                            "No valid GEDI L4A AGBD "
-                            "observation was found within "
-                            "the available search radii."
+                            "No valid GEDI L4A "
+                            "AGBD observation was found "
+                            "within the available search radii."
                         ),
                 }
 
@@ -3439,8 +3883,12 @@ def satellite_agb_analysis(
             item
             for item in historical
             if (
-                item.get("available")
-                and item.get("agbd_mg_ha") is not None
+                item.get(
+                    "available"
+                )
+                and item.get(
+                    "agbd_mg_ha"
+                ) is not None
             )
         ]
 
@@ -3448,7 +3896,9 @@ def satellite_agb_analysis(
             (
                 item
                 for item in historical
-                if item.get("year") == req.year
+                if item.get(
+                    "year"
+                ) == req.year
             ),
             None,
         )
@@ -3553,16 +4003,21 @@ def satellite_agb_analysis(
 
                 "reason":
                     (
-                        "No valid GEDI L4A AGBD "
-                        "observations were found from "
-                        "2019 through the requested year."
+                        "No valid GEDI L4A "
+                        "AGBD observations were found "
+                        "from 2019 through the requested year."
                     ),
             }
 
             effective_year = None
 
-            effective_region = requested_region
-            effective_radius = req.radius_m
+            effective_region = (
+                requested_region
+            )
+
+            effective_radius = (
+                req.radius_m
+            )
 
         selected_agb = (
             selected_year_result.get(
@@ -3577,7 +4032,8 @@ def satellite_agb_analysis(
         latest_available = (
             max(
                 available_observations,
-                key=lambda item: item["year"],
+                key=lambda item:
+                    item["year"],
             )
             if available_observations
             else None
@@ -3598,10 +4054,12 @@ def satellite_agb_analysis(
 
                 previous_available = max(
                     earlier_observations,
-                    key=lambda item: item["year"],
+                    key=lambda item:
+                        item["year"],
                 )
 
         change_absolute = None
+
         change_percent = None
 
         if (
@@ -3665,7 +4123,9 @@ def satellite_agb_analysis(
             and effective_year != req.year
         ):
 
-            sentinel_year = effective_year
+            sentinel_year = (
+                effective_year
+            )
 
             sentinel = (
                 get_yearly_sentinel_rgb(
@@ -3772,7 +4232,9 @@ def satellite_agb_analysis(
 
                 "year":
                     (
-                        latest_available["year"]
+                        latest_available[
+                            "year"
+                        ]
                         if latest_available
                         else None
                     ),
