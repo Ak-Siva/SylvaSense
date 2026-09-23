@@ -6,10 +6,9 @@ numpy
 pandas
 pillow
 matplotlib
-deepforest
 scikit-learn
-streamlit
 earthengine-api
 geopandas
 shapely
 rasterio
+deepforest
