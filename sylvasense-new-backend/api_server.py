@@ -1,3 +1,19 @@
+# ============================================================
+# SYLVASENSE BACKEND
+# Memory-safe Render + Earth Engine + Supabase version
+# ============================================================
+
+# IMPORTANT:
+# Set low CPU/thread usage BEFORE importing numpy / torch.
+import os
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 from pathlib import Path
 from functools import lru_cache
 
@@ -6,27 +22,117 @@ from fastapi import (
     UploadFile,
     File,
     HTTPException,
-    BackgroundTasks,
 )
+
+from fastapi.responses import FileResponse
 
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 
 import tempfile
-import os
 import traceback
 import uuid
 import math
-import base64
 import urllib.request
 import threading
 import json
+import gc
+import time
 from datetime import datetime, timezone
 
 import numpy as np
-import pandas as pd
 
 import ee
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+APP_VERSION = "2.0.0"
+
+MAX_IMAGE_UPLOAD_MB = int(
+    os.getenv(
+        "MAX_IMAGE_UPLOAD_MB",
+        "25",
+    )
+)
+
+MAX_SATELLITE_IMAGE_MB = int(
+    os.getenv(
+        "MAX_SATELLITE_IMAGE_MB",
+        "8",
+    )
+)
+
+SATELLITE_IMAGE_TTL_SECONDS = int(
+    os.getenv(
+        "SATELLITE_IMAGE_TTL_SECONDS",
+        "21600",
+    )
+)
+
+ENABLE_DEEPFOREST = (
+    os.getenv(
+        "ENABLE_DEEPFOREST",
+        "true",
+    ).lower()
+    in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+)
+
+
+# ============================================================
+# MEMORY / CONCURRENCY PROTECTION
+# ============================================================
+
+# Only ONE Earth Engine operation at a time.
+EE_REQUEST_LOCK = threading.Lock()
+
+# Only ONE DeepForest image analysis at a time.
+IMAGE_ANALYSIS_LOCK = threading.Lock()
+
+
+# ============================================================
+# DIRECTORIES
+# ============================================================
+
+JOB_STORAGE_DIR = Path(
+    os.getenv(
+        "SYLVASENSE_JOB_DIR",
+        "/tmp/sylvasense_jobs",
+    )
+)
+
+JOB_STORAGE_FILE = (
+    JOB_STORAGE_DIR / "image_jobs.json"
+)
+
+SATELLITE_IMAGE_DIR = Path(
+    os.getenv(
+        "SYLVASENSE_SATELLITE_DIR",
+        "/tmp/sylvasense_satellite_images",
+    )
+)
+
+
+def ensure_directories():
+    JOB_STORAGE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    SATELLITE_IMAGE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+
+ensure_directories()
 
 
 # ============================================================
@@ -35,12 +141,12 @@ import ee
 
 app = FastAPI(
     title="SYLVASENSE Backend",
-    version="1.5.0",
+    version=APP_VERSION,
     description=(
         "SYLVASENSE Earth Observation platform with "
         "tree detection, crown segmentation, biomass, "
-        "AGB analysis, Sentinel-1/Sentinel-2, "
-        "NDVI, GEDI and change detection."
+        "AGB analysis, Sentinel-1/Sentinel-2, NDVI, "
+        "GEDI and change detection."
     ),
 )
 
@@ -60,107 +166,50 @@ app.add_middleware(
 
 # ============================================================
 # JOB STORAGE
-#
-# In-memory storage is kept for fast access.
-#
-# A JSON file is also used so that job information survives
-# accidental application reloads/restarts during the lifetime
-# of the Render instance.
 # ============================================================
 
 _image_jobs = {}
-
 _image_jobs_lock = threading.Lock()
-
-JOB_STORAGE_DIR = Path(
-    os.getenv(
-        "SYLVASENSE_JOB_DIR",
-        "/tmp/sylvasense_jobs",
-    )
-)
-
-JOB_STORAGE_FILE = (
-    JOB_STORAGE_DIR / "image_jobs.json"
-)
-
-
-def ensure_job_storage():
-    try:
-        JOB_STORAGE_DIR.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-    except Exception as exc:
-
-        print(
-            "Job storage directory creation failed:"
-        )
-
-        print(exc)
 
 
 def load_persisted_jobs():
-
-    ensure_job_storage()
+    ensure_directories()
 
     if not JOB_STORAGE_FILE.exists():
         return
 
     try:
-
         with open(
             JOB_STORAGE_FILE,
             "r",
             encoding="utf-8",
         ) as file:
-
             data = json.load(file)
 
-        if not isinstance(
-            data,
-            dict,
-        ):
+        if not isinstance(data, dict):
             return
 
         with _image_jobs_lock:
-
             for job_id, job in data.items():
-
-                if isinstance(
-                    job,
-                    dict,
-                ):
-
-                    _image_jobs[
-                        job_id
-                    ] = job
+                if isinstance(job, dict):
+                    _image_jobs[job_id] = job
 
     except Exception as exc:
-
         print(
-            "Could not load persisted image jobs:"
+            "[JOBS] Could not load persisted jobs:",
+            exc,
         )
-
-        print(exc)
 
 
 def save_persisted_jobs():
-
-    ensure_job_storage()
+    ensure_directories()
 
     try:
-
         with _image_jobs_lock:
+            snapshot = dict(_image_jobs)
 
-            snapshot = dict(
-                _image_jobs
-            )
-
-        temporary_file = (
-            JOB_STORAGE_FILE.with_suffix(
-                ".tmp"
-            )
+        temporary_file = JOB_STORAGE_FILE.with_suffix(
+            ".tmp"
         )
 
         with open(
@@ -168,7 +217,6 @@ def save_persisted_jobs():
             "w",
             encoding="utf-8",
         ) as file:
-
             json.dump(
                 snapshot,
                 file,
@@ -182,86 +230,109 @@ def save_persisted_jobs():
         )
 
     except Exception as exc:
-
         print(
-            "Could not persist image jobs:"
+            "[JOBS] Could not persist jobs:",
+            exc,
         )
 
-        print(exc)
 
-
-# Load any jobs available from this process/container.
 load_persisted_jobs()
+
+
+# ============================================================
+# MEMORY CLEANUP
+# ============================================================
+
+def force_memory_cleanup():
+    """
+    Run Python garbage collection.
+
+    This does not guarantee that the OS immediately returns
+    every allocated page, but it releases unreachable Python
+    objects and helps reduce retained memory.
+    """
+    try:
+        gc.collect()
+        gc.collect()
+    except Exception:
+        pass
+
+
+# ============================================================
+# PYTORCH THREAD CONTROL
+# ============================================================
+
+def configure_torch_threads():
+    try:
+        import torch
+
+        try:
+            torch.set_num_threads(1)
+        except Exception:
+            pass
+
+        try:
+            torch.set_num_interop_threads(1)
+        except Exception:
+            pass
+
+    except Exception:
+        pass
 
 
 # ============================================================
 # DEEPFOREST MODEL
 #
 # IMPORTANT:
-# tree_detection is imported only when the model is actually
-# requested. This keeps Render startup memory much lower.
+# No permanent lru_cache is used here.
+#
+# The model is loaded for one analysis and released after
+# analysis so Render does not permanently retain the model.
 # ============================================================
 
-@lru_cache(maxsize=1)
-def get_deepforest_model():
+def load_deepforest_model():
+    if not ENABLE_DEEPFOREST:
+        raise RuntimeError(
+            "DeepForest image analysis is disabled. "
+            "Set ENABLE_DEEPFOREST=true in Render "
+            "Environment Variables to enable it."
+        )
+
+    configure_torch_threads()
 
     from tree_detection import load_model
 
-    return load_model()
+    model = load_model()
+
+    return model
 
 
 # ============================================================
-# IMAGE ANALYSIS JOB HELPERS
+# IMAGE JOB HELPERS
 # ============================================================
 
-def create_image_job(
-    filename,
-):
-
+def create_image_job(filename):
     job_id = uuid.uuid4().hex
 
+    now = datetime.now(
+        timezone.utc
+    ).isoformat()
+
     job = {
-
-        "job_id":
-            job_id,
-
-        "filename":
-            filename,
-
-        "status":
-            "queued",
-
-        "progress":
-            0,
-
-        "stage":
-            "Queued",
-
-        "message":
-            "Image analysis is queued.",
-
-        "result":
-            None,
-
-        "error":
-            None,
-
-        "created_at":
-            datetime.now(
-                timezone.utc
-            ).isoformat(),
-
-        "updated_at":
-            datetime.now(
-                timezone.utc
-            ).isoformat(),
+        "job_id": job_id,
+        "filename": filename,
+        "status": "queued",
+        "progress": 0,
+        "stage": "Queued",
+        "message": "Image analysis is queued.",
+        "result": None,
+        "error": None,
+        "created_at": now,
+        "updated_at": now,
     }
 
     with _image_jobs_lock:
-
-        _image_jobs[
-            job_id
-        ] = job
+        _image_jobs[job_id] = job
 
     save_persisted_jobs()
 
@@ -274,12 +345,8 @@ def update_image_job(
     stage,
     message,
 ):
-
     with _image_jobs_lock:
-
-        job = _image_jobs.get(
-            job_id
-        )
+        job = _image_jobs.get(job_id)
 
         if job is None:
             return
@@ -299,16 +366,9 @@ def update_image_job(
         job["message"] = message
 
         if progress >= 100:
-
-            job["status"] = (
-                "completed"
-            )
-
+            job["status"] = "completed"
         elif progress > 0:
-
-            job["status"] = (
-                "running"
-            )
+            job["status"] = "running"
 
         job["updated_at"] = (
             datetime.now(
@@ -323,34 +383,20 @@ def complete_image_job(
     job_id,
     result,
 ):
-
     with _image_jobs_lock:
-
-        job = _image_jobs.get(
-            job_id
-        )
+        job = _image_jobs.get(job_id)
 
         if job is None:
             return
 
         job["progress"] = 100
-
-        job["status"] = (
-            "completed"
-        )
-
-        job["stage"] = (
-            "Complete"
-        )
-
+        job["status"] = "completed"
+        job["stage"] = "Complete"
         job["message"] = (
             "Image analysis completed successfully."
         )
-
         job["result"] = result
-
         job["error"] = None
-
         job["updated_at"] = (
             datetime.now(
                 timezone.utc
@@ -364,76 +410,36 @@ def fail_image_job(
     job_id,
     error,
 ):
-
     with _image_jobs_lock:
-
-        job = _image_jobs.get(
-            job_id
-        )
+        job = _image_jobs.get(job_id)
 
         if job is None:
-
-            # The process may have restarted and
-            # the original job may not be available.
-            # Recreate a failure record so the frontend
-            # receives a useful response.
-            _image_jobs[
-                job_id
-            ] = {
-
-                "job_id":
-                    job_id,
-
-                "filename":
-                    "unknown",
-
-                "status":
-                    "failed",
-
-                "progress":
-                    0,
-
-                "stage":
-                    "Failed",
-
-                "message":
-                    str(error),
-
-                "result":
-                    None,
-
-                "error":
-                    str(error),
-
-                "created_at":
+            _image_jobs[job_id] = {
+                "job_id": job_id,
+                "filename": "unknown",
+                "status": "failed",
+                "progress": 0,
+                "stage": "Failed",
+                "message": str(error),
+                "result": None,
+                "error": str(error),
+                "created_at": (
                     datetime.now(
                         timezone.utc
-                    ).isoformat(),
-
-                "updated_at":
+                    ).isoformat()
+                ),
+                "updated_at": (
                     datetime.now(
                         timezone.utc
-                    ).isoformat(),
+                    ).isoformat()
+                ),
             }
 
         else:
-
-            job["status"] = (
-                "failed"
-            )
-
-            job["stage"] = (
-                "Failed"
-            )
-
-            job["message"] = (
-                str(error)
-            )
-
-            job["error"] = (
-                str(error)
-            )
-
+            job["status"] = "failed"
+            job["stage"] = "Failed"
+            job["message"] = str(error)
+            job["error"] = str(error)
             job["updated_at"] = (
                 datetime.now(
                     timezone.utc
@@ -450,52 +456,71 @@ def fail_image_job(
 def make_json_safe(obj):
 
     if isinstance(obj, dict):
-
         return {
             str(key): make_json_safe(value)
             for key, value in obj.items()
         }
 
     if isinstance(obj, list):
-
         return [
             make_json_safe(value)
             for value in obj
         ]
 
     if isinstance(obj, tuple):
-
         return [
             make_json_safe(value)
             for value in obj
         ]
 
-    if isinstance(obj, pd.DataFrame):
+    # Pandas is intentionally imported only when an object
+    # actually comes from Pandas.
+    obj_module = getattr(
+        obj.__class__,
+        "__module__",
+        "",
+    )
 
-        return make_json_safe(
-            obj.to_dict(
-                orient="records"
-            )
-        )
+    if obj_module.startswith("pandas"):
+        try:
+            import pandas as pd
 
-    if isinstance(obj, pd.Series):
+            if isinstance(
+                obj,
+                pd.DataFrame,
+            ):
+                return make_json_safe(
+                    obj.to_dict(
+                        orient="records"
+                    )
+                )
 
-        return make_json_safe(
-            obj.to_dict()
-        )
+            if isinstance(
+                obj,
+                pd.Series,
+            ):
+                return make_json_safe(
+                    obj.to_dict()
+                )
+
+            if isinstance(
+                obj,
+                pd.Timestamp,
+            ):
+                return obj.isoformat()
+
+        except Exception:
+            pass
 
     if isinstance(obj, np.ndarray):
-
         return make_json_safe(
             obj.tolist()
         )
 
     if isinstance(obj, np.integer):
-
         return int(obj)
 
     if isinstance(obj, np.floating):
-
         value = float(obj)
 
         if (
@@ -507,11 +532,9 @@ def make_json_safe(obj):
         return value
 
     if isinstance(obj, np.bool_):
-
         return bool(obj)
 
     if isinstance(obj, float):
-
         if (
             math.isnan(obj)
             or math.isinf(obj)
@@ -524,50 +547,19 @@ def make_json_safe(obj):
         obj,
         (str, int, bool),
     ):
-
         return obj
 
-    try:
-
-        missing = pd.isna(obj)
-
-        if (
-            isinstance(
-                missing,
-                bool,
-            )
-            and missing
-        ):
-            return None
-
-    except Exception:
-        pass
-
-    if isinstance(
-        obj,
-        pd.Timestamp,
-    ):
-
-        return obj.isoformat()
-
-    if isinstance(
-        obj,
-        Path,
-    ):
-
+    if isinstance(obj, Path):
         return str(obj)
 
     if hasattr(
         obj,
         "__geo_interface__",
     ):
-
         try:
-
             return make_json_safe(
                 obj.__geo_interface__
             )
-
         except Exception:
             pass
 
@@ -575,15 +567,24 @@ def make_json_safe(obj):
         obj,
         "to_dict",
     ):
-
         try:
-
             return make_json_safe(
                 obj.to_dict()
             )
-
         except Exception:
             pass
+
+    try:
+        missing = obj != obj
+
+        if isinstance(
+            missing,
+            bool,
+        ) and missing:
+            return None
+
+    except Exception:
+        pass
 
     return str(obj)
 
@@ -592,10 +593,7 @@ def make_json_safe(obj):
 # IMAGE VALIDATION
 # ============================================================
 
-def validate_image(
-    filename,
-):
-
+def validate_image(filename):
     suffix = Path(
         filename or ""
     ).suffix.lower()
@@ -609,7 +607,6 @@ def validate_image(
     }
 
     if suffix not in allowed:
-
         raise HTTPException(
             status_code=400,
             detail=(
@@ -630,7 +627,6 @@ def build_satellite_region(
     longitude,
     radius_m,
 ):
-
     point = ee.Geometry.Point(
         [
             longitude,
@@ -638,13 +634,11 @@ def build_satellite_region(
         ]
     )
 
-    region = (
+    return (
         point
         .buffer(radius_m)
         .bounds()
     )
-
-    return region
 
 
 # ============================================================
@@ -658,11 +652,255 @@ def initialize_earth_engine():
         "syylvasense",
     )
 
-    ee.Initialize(
-        project=project
+    service_account = os.getenv(
+        "GEE_SERVICE_ACCOUNT"
     )
 
-    return project
+    private_key = os.getenv(
+        "GEE_PRIVATE_KEY"
+    )
+
+    # --------------------------------------------------------
+    # RENDER / SERVICE ACCOUNT AUTHENTICATION
+    # --------------------------------------------------------
+
+    if service_account and private_key:
+
+        # Render environment variables may contain literal
+        # escaped newlines instead of real newlines.
+        private_key = (
+            private_key
+            .replace(
+                "\\n",
+                "\n",
+            )
+            .strip()
+        )
+
+        credentials = ee.ServiceAccountCredentials(
+            service_account,
+            key_data=private_key,
+        )
+
+        ee.Initialize(
+            credentials=credentials,
+            project=project,
+        )
+
+        return project
+
+    # --------------------------------------------------------
+    # LOCAL FALLBACK
+    #
+    # This allows local development after:
+    #
+    # earthengine authenticate
+    #
+    # --------------------------------------------------------
+
+    try:
+        ee.Initialize(
+            project=project
+        )
+
+        return project
+
+    except Exception as exc:
+
+        raise RuntimeError(
+            "Google Earth Engine authentication failed. "
+            "On Render, configure GEE_PROJECT, "
+            "GEE_SERVICE_ACCOUNT and GEE_PRIVATE_KEY. "
+            "Locally, run 'earthengine authenticate'. "
+            f"Original error: {exc}"
+        ) from exc
+
+
+# ============================================================
+# GEE STATUS / DIAGNOSTIC
+# ============================================================
+
+@app.get("/api/gee-status")
+def gee_status():
+
+    try:
+
+        with EE_REQUEST_LOCK:
+
+            project = (
+                initialize_earth_engine()
+            )
+
+            test_result = (
+                ee.Number(1)
+                .add(1)
+                .getInfo()
+            )
+
+        return {
+            "authenticated": True,
+            "project": project,
+            "test_result": test_result,
+            "service_account_configured": bool(
+                os.getenv(
+                    "GEE_SERVICE_ACCOUNT"
+                )
+            ),
+            "private_key_configured": bool(
+                os.getenv(
+                    "GEE_PRIVATE_KEY"
+                )
+            ),
+        }
+
+    except Exception as exc:
+
+        traceback.print_exc()
+
+        return {
+            "authenticated": False,
+            "project": os.getenv(
+                "GEE_PROJECT",
+                "syylvasense",
+            ),
+            "service_account_configured": bool(
+                os.getenv(
+                    "GEE_SERVICE_ACCOUNT"
+                )
+            ),
+            "private_key_configured": bool(
+                os.getenv(
+                    "GEE_PRIVATE_KEY"
+                )
+            ),
+            "error": (
+                f"{type(exc).__name__}: {exc}"
+            ),
+        }
+
+
+# ============================================================
+# SUPABASE STORAGE
+# ============================================================
+
+def get_supabase_client():
+
+    supabase_url = os.getenv(
+        "SUPABASE_URL"
+    )
+
+    supabase_key = os.getenv(
+        "SUPABASE_SERVICE_ROLE_KEY"
+    )
+
+    if not supabase_url:
+        raise RuntimeError(
+            "SUPABASE_URL is missing."
+        )
+
+    if not supabase_key:
+        raise RuntimeError(
+            "SUPABASE_SERVICE_ROLE_KEY is missing."
+        )
+
+
+def upload_satellite_image_to_supabase(
+    local_path,
+    filename,
+):
+
+    bucket = os.getenv(
+        "SUPABASE_BUCKET",
+        "satellite-images",
+    )
+
+    client = get_supabase_client()
+
+    storage_path = (
+        "sentinel2/"
+        + datetime.now(
+            timezone.utc
+        ).strftime(
+            "%Y/%m/%d"
+        )
+        + "/"
+        + uuid.uuid4().hex
+        + "_"
+        + Path(filename).name
+    )
+
+    with open(
+        local_path,
+        "rb",
+    ) as image_file:
+
+        result = (
+            client
+            .storage
+            .from_(bucket)
+            .upload(
+                storage_path,
+                image_file,
+                file_options={
+                    "content-type":
+                        "image/png",
+                    "upsert":
+                        "true",
+                },
+            )
+        )
+
+    # For a public bucket.
+    public_url = (
+        client
+        .storage
+        .from_(bucket)
+        .get_public_url(
+            storage_path
+        )
+    )
+
+    return {
+        "bucket": bucket,
+        "path": storage_path,
+        "public_url": public_url,
+        "upload_result": str(result),
+    }
+
+
+# ============================================================
+# SATELLITE LOCAL IMAGE CLEANUP
+# ============================================================
+
+def cleanup_old_satellite_images():
+
+    ensure_directories()
+
+    now = time.time()
+
+    try:
+
+        for path in SATELLITE_IMAGE_DIR.iterdir():
+
+            if not path.is_file():
+                continue
+
+            try:
+                age = (
+                    now
+                    - path.stat().st_mtime
+                )
+
+                if age > SATELLITE_IMAGE_TTL_SECONDS:
+                    path.unlink(
+                        missing_ok=True
+                    )
+
+            except Exception:
+                pass
+
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -678,7 +916,6 @@ def mask_s2_clouds_satellite(
     )
 
     cloud_bit_mask = 1 << 10
-
     cirrus_bit_mask = 1 << 11
 
     mask = (
@@ -715,12 +952,7 @@ def get_sentinel2_rgb_image(
     max_cloud_pct,
 ):
 
-    selected_point = ee.Geometry.Point(
-        [
-            longitude,
-            latitude,
-        ]
-    )
+    cleanup_old_satellite_images()
 
     collection = (
         ee.ImageCollection(
@@ -749,111 +981,29 @@ def get_sentinel2_rgb_image(
         or 0
     )
 
+    empty_result = {
+        "available": False,
+        "scene_count": 0,
+        "url": None,
+        "data_url": None,
+        "image_url": None,
+        "storage_path": None,
+        "date": None,
+        "cloud_percentage": None,
+        "scene_id": None,
+        "center": {
+            "latitude": latitude,
+            "longitude": longitude,
+        },
+        "radius_m": radius_m,
+    }
+
     if scene_count == 0:
-
-        return {
-
-            "available":
-                False,
-
-            "scene_count":
-                0,
-
-            "url":
-                None,
-
-            "data_url":
-                None,
-
-            "date":
-                None,
-
-            "cloud_percentage":
-                None,
-
-            "scene_id":
-                None,
-
-            "center": {
-
-                "latitude":
-                    latitude,
-
-                "longitude":
-                    longitude,
-            },
-
-            "radius_m":
-                radius_m,
-        }
+        return empty_result
 
     image = ee.Image(
         collection.first()
     )
-
-    intersection_collection = (
-        ee.ImageCollection(
-            "COPERNICUS/S2_SR_HARMONIZED"
-        )
-        .filterBounds(
-            selected_point
-        )
-        .filterDate(
-            start_date,
-            end_date,
-        )
-        .filter(
-            ee.Filter.lte(
-                "CLOUDY_PIXEL_PERCENTAGE",
-                max_cloud_pct,
-            )
-        )
-    )
-
-    intersection_count = int(
-        intersection_collection
-        .size()
-        .getInfo()
-        or 0
-    )
-
-    if intersection_count == 0:
-
-        return {
-
-            "available":
-                False,
-
-            "scene_count":
-                0,
-
-            "url":
-                None,
-
-            "data_url":
-                None,
-
-            "date":
-                None,
-
-            "cloud_percentage":
-                None,
-
-            "scene_id":
-                None,
-
-            "center": {
-
-                "latitude":
-                    latitude,
-
-                "longitude":
-                    longitude,
-            },
-
-            "radius_m":
-                radius_m,
-        }
 
     image_info = (
         image.getInfo()
@@ -893,8 +1043,7 @@ def get_sentinel2_rgb_image(
             )
 
         except Exception:
-
-            acquisition_date = None
+            pass
 
     cloud_percentage = (
         properties.get(
@@ -914,38 +1063,20 @@ def get_sentinel2_rgb_image(
     )
 
     visualization = {
-
         "bands": [
             "B4",
             "B3",
             "B2",
         ],
-
-        "min":
-            0.0,
-
-        "max":
-            0.3,
+        "min": 0.0,
+        "max": 0.3,
     }
 
-    region_info = (
-        region.getInfo()
-    )
-
     thumbnail_params = {
-
-        "region":
-            region,
-
-        "dimensions":
-            1024,
-
-        "format":
-            "png",
-
-        "crs":
-            "EPSG:4326",
-
+        "region": region,
+        "dimensions": 1024,
+        "format": "png",
+        "crs": "EPSG:4326",
         **visualization,
     }
 
@@ -956,9 +1087,24 @@ def get_sentinel2_rgb_image(
         )
     )
 
-    data_url = None
+    local_filename = (
+        "satellite_"
+        + (
+            acquisition_date
+            or "image"
+        )
+        + "_"
+        + uuid.uuid4().hex
+        + ".png"
+    )
+
+    local_path = (
+        SATELLITE_IMAGE_DIR
+        / local_filename
+    )
 
     image_size_bytes = None
+    supabase_info = None
 
     try:
 
@@ -966,57 +1112,101 @@ def get_sentinel2_rgb_image(
             thumbnail_url,
             headers={
                 "User-Agent":
-                    "SylvaSense/1.5.0"
+                    "SylvaSense/2.0.0"
             },
         )
+
+        max_bytes = (
+            MAX_SATELLITE_IMAGE_MB
+            * 1024
+            * 1024
+        )
+
+        downloaded = 0
 
         with urllib.request.urlopen(
             request,
             timeout=60,
         ) as response:
 
-            image_bytes = (
-                response.read()
-            )
+            with open(
+                local_path,
+                "wb",
+            ) as output:
+
+                while True:
+
+                    chunk = response.read(
+                        64 * 1024
+                    )
+
+                    if not chunk:
+                        break
+
+                    downloaded += len(
+                        chunk
+                    )
+
+                    if downloaded > max_bytes:
+
+                        raise ValueError(
+                            "Satellite thumbnail exceeded "
+                            f"{MAX_SATELLITE_IMAGE_MB} MB."
+                        )
+
+                    output.write(
+                        chunk
+                    )
 
         image_size_bytes = (
-            len(image_bytes)
+            local_path.stat().st_size
         )
 
-        if not image_bytes:
-
+        if image_size_bytes <= 0:
             raise ValueError(
                 "Earth Engine returned an empty image."
             )
 
-        encoded = (
-            base64.b64encode(
-                image_bytes
+        # ----------------------------------------------------
+        # SUPABASE UPLOAD
+        # ----------------------------------------------------
+
+        supabase_info = (
+            upload_satellite_image_to_supabase(
+                local_path=local_path,
+                filename=local_filename,
             )
-            .decode("utf-8")
         )
 
-        data_url = (
-            "data:image/png;base64,"
-            + encoded
+        image_url = (
+            supabase_info.get(
+                "public_url"
+            )
         )
 
-    except Exception as download_error:
+    except Exception as exc:
 
         print(
-            "Satellite thumbnail download failed:"
+            "[SATELLITE] Image storage failed:",
+            exc,
         )
 
-        print(
-            download_error
-        )
+        image_url = None
 
-        data_url = None
+    finally:
+
+        # Local copy is temporary only.
+        try:
+
+            if local_path.exists():
+                local_path.unlink()
+
+        except Exception:
+            pass
 
     return {
-
         "available":
-            data_url is not None,
+            image_url is not None,
 
         "scene_count":
             scene_count,
@@ -1024,8 +1214,27 @@ def get_sentinel2_rgb_image(
         "url":
             thumbnail_url,
 
+        # IMPORTANT:
+        # No Base64 data_url anymore.
         "data_url":
-            data_url,
+            None,
+
+        "image_url":
+            image_url,
+
+        "storage":
+            "supabase"
+            if image_url
+            else None,
+
+        "storage_path":
+            (
+                supabase_info.get(
+                    "path"
+                )
+                if supabase_info
+                else None
+            ),
 
         "type":
             "Sentinel-2 RGB",
@@ -1058,25 +1267,18 @@ def get_sentinel2_rgb_image(
             radius_m,
 
         "center": {
-
             "latitude":
                 latitude,
-
             "longitude":
                 longitude,
         },
 
         "selected_location": {
-
             "latitude":
                 latitude,
-
             "longitude":
                 longitude,
         },
-
-        "region":
-            region_info,
 
         "image_size_bytes":
             image_size_bytes,
@@ -1105,11 +1307,38 @@ def run_image_analysis_job(
     filename,
 ):
 
+    model = None
+    predictions = None
+    segmentation_output = None
+    df = None
+    biomass_result = None
+    response = None
+
+    acquired = False
+
     try:
 
         # ----------------------------------------------------
-        # START JOB IMMEDIATELY
+        # SINGLE DEEPFOREST JOB
         # ----------------------------------------------------
+
+        acquired = (
+            IMAGE_ANALYSIS_LOCK.acquire(
+                timeout=5
+            )
+        )
+
+        if not acquired:
+
+            fail_image_job(
+                job_id,
+                (
+                    "Another image analysis is currently "
+                    "running. Please try again after it finishes."
+                ),
+            )
+
+            return
 
         update_image_job(
             job_id,
@@ -1123,7 +1352,18 @@ def run_image_analysis_job(
         )
 
         # ----------------------------------------------------
-        # IMPORT HEAVY MODULES ONLY WHEN REQUIRED
+        # CHECK DEEPFOREST
+        # ----------------------------------------------------
+
+        if not ENABLE_DEEPFOREST:
+
+            raise RuntimeError(
+                "DeepForest analysis is disabled. "
+                "Set ENABLE_DEEPFOREST=true on Render."
+            )
+
+        # ----------------------------------------------------
+        # HEAVY MODULES
         # ----------------------------------------------------
 
         update_image_job(
@@ -1133,38 +1373,20 @@ def run_image_analysis_job(
             "Loading tree detection and biomass modules...",
         )
 
-        print(
-            "[IMAGE ANALYSIS] Importing tree_detection..."
-        )
+        configure_torch_threads()
 
         from tree_detection import (
             detect_trees,
             compute_crown_metrics,
         )
 
-        print(
-            "[IMAGE ANALYSIS] Importing crown_segmentation..."
-        )
-
         from crown_segmentation import (
             segment_tree_crowns,
-        )
-
-        print(
-            "[IMAGE ANALYSIS] Importing biomass..."
         )
 
         from biomass import (
             per_tree_biomass_pipeline,
         )
-
-        print(
-            "[IMAGE ANALYSIS] All analysis modules loaded."
-        )
-
-        # ----------------------------------------------------
-        # FILE READY
-        # ----------------------------------------------------
 
         update_image_job(
             job_id,
@@ -1174,7 +1396,7 @@ def run_image_analysis_job(
         )
 
         # ----------------------------------------------------
-        # MODEL LOADING
+        # MODEL
         # ----------------------------------------------------
 
         update_image_job(
@@ -1185,16 +1407,10 @@ def run_image_analysis_job(
         )
 
         print(
-            "[IMAGE ANALYSIS] Loading DeepForest model..."
+            "[IMAGE ANALYSIS] Loading DeepForest..."
         )
 
-        model = (
-            get_deepforest_model()
-        )
-
-        print(
-            "[IMAGE ANALYSIS] DeepForest model loaded."
-        )
+        model = load_deepforest_model()
 
         update_image_job(
             job_id,
@@ -1214,10 +1430,6 @@ def run_image_analysis_job(
             "Detecting individual trees with DeepForest...",
         )
 
-        print(
-            "[IMAGE ANALYSIS] Starting tree detection..."
-        )
-
         predictions = detect_trees(
             model,
             temp_path,
@@ -1226,15 +1438,9 @@ def run_image_analysis_job(
             iou_threshold=0.15,
         )
 
-        print(
-            "[IMAGE ANALYSIS] Tree detection returned."
-        )
-
-        predictions = (
-            compute_crown_metrics(
-                predictions,
-                pixel_size_m=0.1,
-            )
+        predictions = compute_crown_metrics(
+            predictions,
+            pixel_size_m=0.1,
         )
 
         tree_count = len(
@@ -1246,47 +1452,36 @@ def run_image_analysis_job(
         )
 
         # ----------------------------------------------------
-        # LOG DETECTED BOXES
+        # TREE BOX LOGGING
         # ----------------------------------------------------
 
-        print(
-            "\n========== DETECTED TREE BOXES =========="
-        )
+        try:
 
-        box_columns = [
-            column
-            for column in [
-                "xmin",
-                "ymin",
-                "xmax",
-                "ymax",
-                "score",
-                "label",
+            box_columns = [
+                column
+                for column in [
+                    "xmin",
+                    "ymin",
+                    "xmax",
+                    "ymax",
+                    "score",
+                    "label",
+                ]
+                if column in predictions.columns
             ]
-            if column in predictions.columns
-        ]
 
-        if box_columns:
+            if box_columns:
 
-            print(
-                predictions[
-                    box_columns
-                ].to_string(
-                    index=False
+                print(
+                    predictions[
+                        box_columns
+                    ].to_string(
+                        index=False
+                    )
                 )
-            )
 
-        else:
-
-            print(
-                "Bounding-box columns were not found. "
-                f"Available columns: "
-                f"{list(predictions.columns)}"
-            )
-
-        print(
-            "=========================================\n"
-        )
+        except Exception:
+            pass
 
         update_image_job(
             job_id,
@@ -1334,36 +1529,22 @@ def run_image_analysis_job(
         if predictions.empty:
 
             biomass_result = {
-
-                "status":
-                    "success",
-
-                "tree_count":
-                    0,
-
-                "total_agb_tonnes":
-                    0.0,
-
-                "total_carbon_tonnes":
-                    0.0,
-
-                "total_co2e_tonnes":
-                    0.0,
-
-                "trees":
-                    [],
+                "status": "success",
+                "tree_count": 0,
+                "total_agb_tonnes": 0.0,
+                "total_carbon_tonnes": 0.0,
+                "total_co2e_tonnes": 0.0,
+                "trees": [],
             }
 
         else:
 
-            df = (
-                per_tree_biomass_pipeline(
-                    predictions,
-                    wood_density_g_cm3=0.6,
-                    crown_diameter_column=(
-                        "crown_diameter_m"
-                    ),
-                )
+            df = per_tree_biomass_pipeline(
+                predictions,
+                wood_density_g_cm3=0.6,
+                crown_diameter_column=(
+                    "crown_diameter_m"
+                ),
             )
 
             trees = []
@@ -1373,7 +1554,6 @@ def run_image_analysis_job(
                 trees.append(
                     make_json_safe(
                         {
-
                             "tree_id":
                                 int(i) + 1,
 
@@ -1416,7 +1596,6 @@ def run_image_analysis_job(
                 )
 
             biomass_result = {
-
                 "status":
                     "success",
 
@@ -1477,7 +1656,6 @@ def run_image_analysis_job(
         )
 
         response = {
-
             "status":
                 "success",
 
@@ -1540,6 +1718,10 @@ def run_image_analysis_job(
 
     finally:
 
+        # ----------------------------------------------------
+        # RELEASE TEMP FILE
+        # ----------------------------------------------------
+
         if (
             temp_path
             and os.path.exists(
@@ -1548,11 +1730,60 @@ def run_image_analysis_job(
         ):
 
             try:
-
                 os.remove(
                     temp_path
                 )
+            except Exception:
+                pass
 
+        # ----------------------------------------------------
+        # RELEASE LARGE OBJECTS
+        # ----------------------------------------------------
+
+        try:
+            del predictions
+        except Exception:
+            pass
+
+        try:
+            del segmentation_output
+        except Exception:
+            pass
+
+        try:
+            del df
+        except Exception:
+            pass
+
+        try:
+            del biomass_result
+        except Exception:
+            pass
+
+        try:
+            del response
+        except Exception:
+            pass
+
+        # ----------------------------------------------------
+        # RELEASE DEEPFOREST MODEL
+        # ----------------------------------------------------
+
+        try:
+            del model
+        except Exception:
+            pass
+
+        force_memory_cleanup()
+
+        # ----------------------------------------------------
+        # RELEASE SINGLE-JOB LOCK
+        # ----------------------------------------------------
+
+        if acquired:
+
+            try:
+                IMAGE_ANALYSIS_LOCK.release()
             except Exception:
                 pass
 
@@ -1565,7 +1796,6 @@ def run_image_analysis_job(
 def root():
 
     return {
-
         "service":
             "SYLVASENSE backend",
 
@@ -1576,7 +1806,7 @@ def root():
             "/docs",
 
         "version":
-            "1.5.0",
+            APP_VERSION,
     }
 
 
@@ -1588,40 +1818,53 @@ def root():
 def status():
 
     return {
-
         "status":
             "healthy",
 
         "service":
             "SYLVASENSE backend",
 
+        "version":
+            APP_VERSION,
+
+        "deepforest_enabled":
+            ENABLE_DEEPFOREST,
+
         "deepforest_model":
             "weecology/deepforest-tree",
 
+        "supabase_storage":
+            bool(
+                os.getenv(
+                    "SUPABASE_URL"
+                )
+                and os.getenv(
+                    "SUPABASE_SERVICE_ROLE_KEY"
+                )
+            ),
+
+        "earth_engine_service_account":
+            bool(
+                os.getenv(
+                    "GEE_SERVICE_ACCOUNT"
+                )
+                and os.getenv(
+                    "GEE_PRIVATE_KEY"
+                )
+            ),
+
         "modules": [
-
             "tree_detection",
-
             "crown_segmentation",
-
             "biomass",
-
             "sentinel_1",
-
             "sentinel_2",
-
             "ndvi",
-
             "gedi_lidar",
-
             "agb_forecasting",
-
             "change_detection",
-
             "satellite_agb",
-
             "satellite_rgb_acquisition",
-
             "image_analysis_progress",
         ],
     }
@@ -1648,7 +1891,6 @@ def health():
     "/api/image-analyze"
 )
 async def image_analyze(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
 ):
 
@@ -1656,24 +1898,26 @@ async def image_analyze(
         file.filename
     )
 
-    data = await file.read()
+    # --------------------------------------------------------
+    # Prevent multiple analyses from being accepted
+    # simultaneously.
+    # --------------------------------------------------------
 
-    if not data:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded file is empty.",
-        )
-
-    if len(data) > 25 * 1024 * 1024:
+    if IMAGE_ANALYSIS_LOCK.locked():
 
         raise HTTPException(
-            status_code=413,
+            status_code=429,
             detail=(
-                "Image file is too large. "
-                "Maximum size is 25 MB."
+                "Another image analysis is currently "
+                "running. Please wait until it finishes."
             ),
         )
+
+    max_bytes = (
+        MAX_IMAGE_UPLOAD_MB
+        * 1024
+        * 1024
+    )
 
     temp_path = None
 
@@ -1684,18 +1928,49 @@ async def image_analyze(
             suffix=suffix,
         ) as temp:
 
-            temp.write(data)
+            total = 0
+
+            while True:
+
+                chunk = await file.read(
+                    1024 * 1024
+                )
+
+                if not chunk:
+                    break
+
+                total += len(
+                    chunk
+                )
+
+                if total > max_bytes:
+
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            "Image file is too large. "
+                            f"Maximum size is "
+                            f"{MAX_IMAGE_UPLOAD_MB} MB."
+                        ),
+                    )
+
+                temp.write(
+                    chunk
+                )
 
             temp_path = temp.name
+
+        if total <= 0:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded file is empty.",
+            )
 
         job_id = create_image_job(
             file.filename
         )
 
-        # Mark the job as running before starting the worker.
-        # This prevents the frontend from remaining at
-        # "Queued" if the Render background-task scheduler
-        # delays execution.
         update_image_job(
             job_id,
             1,
@@ -1704,8 +1979,8 @@ async def image_analyze(
         )
 
         print(
-            f"[IMAGE ANALYSIS] Queuing job {job_id} "
-            f"for {file.filename}"
+            f"[IMAGE ANALYSIS] Queuing job "
+            f"{job_id} for {file.filename}"
         )
 
         worker = threading.Thread(
@@ -1716,17 +1991,15 @@ async def image_analyze(
                 file.filename,
             ),
             daemon=True,
-            name=f"sylvasense-image-{job_id[:8]}",
+            name=(
+                f"sylvasense-image-"
+                f"{job_id[:8]}"
+            ),
         )
 
         worker.start()
 
-        print(
-            f"[IMAGE ANALYSIS] Worker started for job {job_id}"
-        )
-
         return {
-
             "status":
                 "accepted",
 
@@ -1746,6 +2019,22 @@ async def image_analyze(
                 "Image analysis worker started.",
         }
 
+    except HTTPException:
+        if (
+            temp_path
+            and os.path.exists(
+                temp_path
+            )
+        ):
+            try:
+                os.remove(
+                    temp_path
+                )
+            except Exception:
+                pass
+
+        raise
+
     except Exception as exc:
 
         if (
@@ -1754,13 +2043,10 @@ async def image_analyze(
                 temp_path
             )
         ):
-
             try:
-
                 os.remove(
                     temp_path
                 )
-
             except Exception:
                 pass
 
@@ -1865,13 +2151,11 @@ def image_analysis_progress(
     "/api/tree-detection"
 )
 async def tree_detection(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
 ):
 
     return await image_analyze(
-        background_tasks,
-        file,
+        file
     )
 
 
@@ -1900,7 +2184,7 @@ class ForecastRequest(
 
 
 # ============================================================
-# AGB FORECAST
+# FORECAST
 # ============================================================
 
 @app.post(
@@ -1942,9 +2226,8 @@ def forecast(
             )
         )
 
-        return make_json_safe(
+        response = make_json_safe(
             {
-
                 "status":
                     "success",
 
@@ -1955,6 +2238,10 @@ def forecast(
                     summary,
             }
         )
+
+        force_memory_cleanup()
+
+        return response
 
     except Exception as exc:
 
@@ -2049,6 +2336,24 @@ def satellite_analysis(
             ),
         )
 
+    # --------------------------------------------------------
+    # ONLY ONE EARTH ENGINE REQUEST PIPELINE AT A TIME
+    # --------------------------------------------------------
+
+    acquired = EE_REQUEST_LOCK.acquire(
+        timeout=120
+    )
+
+    if not acquired:
+
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Earth Engine is busy processing "
+                "another request. Please try again."
+            ),
+        )
+
     try:
 
         from spectral_layers import (
@@ -2119,15 +2424,12 @@ def satellite_analysis(
                 continue
 
             if name == "NDVI":
-
                 image = ndvi
 
             elif name.startswith("SAR"):
-
                 image = sar
 
             else:
-
                 image = optical
 
             map_id = image.getMapId(
@@ -2141,7 +2443,6 @@ def satellite_analysis(
             )
 
             layer = {
-
                 "id":
                     (
                         name
@@ -2230,13 +2531,8 @@ def satellite_analysis(
         )
 
         gedi_vis = {
-
-            "min":
-                0,
-
-            "max":
-                40,
-
+            "min": 0,
+            "max": 40,
             "palette": [
                 "440154",
                 "31688e",
@@ -2259,7 +2555,6 @@ def satellite_analysis(
 
         layers.append(
             {
-
                 "id":
                     "gedi_rh98",
 
@@ -2291,12 +2586,7 @@ def satellite_analysis(
             }
         )
 
-        region_info = (
-            region.getInfo()
-        )
-
         response = {
-
             "status":
                 "success",
 
@@ -2304,7 +2594,6 @@ def satellite_analysis(
                 gee_project,
 
             "location": {
-
                 "latitude":
                     req.latitude,
 
@@ -2313,9 +2602,6 @@ def satellite_analysis(
 
                 "radius_m":
                     req.radius_m,
-
-                "region":
-                    region_info,
             },
 
             "satellite_image":
@@ -2410,8 +2696,23 @@ def satellite_analysis(
 
                 "available":
                     satellite_image.get(
-                        "data_url"
+                        "image_url"
                     ) is not None,
+
+                "image_url":
+                    satellite_image.get(
+                        "image_url"
+                    ),
+
+                "storage":
+                    satellite_image.get(
+                        "storage"
+                    ),
+
+                "storage_path":
+                    satellite_image.get(
+                        "storage_path"
+                    ),
 
                 "filename":
                     (
@@ -2465,14 +2766,18 @@ def satellite_analysis(
 
                 "ready_for_image_analysis":
                     satellite_image.get(
-                        "data_url"
+                        "image_url"
                     ) is not None,
             },
         }
 
-        return make_json_safe(
+        result = make_json_safe(
             response
         )
+
+        force_memory_cleanup()
+
+        return result
 
     except HTTPException:
         raise
@@ -2488,6 +2793,15 @@ def satellite_analysis(
                 f"{type(exc).__name__}: {exc}"
             ),
         )
+
+    finally:
+
+        try:
+            EE_REQUEST_LOCK.release()
+        except Exception:
+            pass
+
+        force_memory_cleanup()
 
 
 # ============================================================
@@ -2558,6 +2872,20 @@ def change_detection(
             detail=(
                 "before_date must be earlier "
                 "than after_date."
+            ),
+        )
+
+    acquired = EE_REQUEST_LOCK.acquire(
+        timeout=120
+    )
+
+    if not acquired:
+
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Earth Engine is busy processing "
+                "another request."
             ),
         )
 
@@ -2660,10 +2988,7 @@ def change_detection(
                 status_code=404,
                 detail=(
                     "No Sentinel-2 scenes found "
-                    "for the before period. "
-                    f"Date: {req.before_date}. "
-                    "Try increasing window_days "
-                    "or changing the date."
+                    "for the before period."
                 ),
             )
 
@@ -2673,16 +2998,11 @@ def change_detection(
                 status_code=404,
                 detail=(
                     "No Sentinel-2 scenes found "
-                    "for the after period. "
-                    f"Date: {req.after_date}. "
-                    "Try increasing window_days "
-                    "or changing the date."
+                    "for the after period."
                 ),
             )
 
-        def add_ndvi(
-            image,
-        ):
+        def add_ndvi(image):
 
             ndvi = (
                 image
@@ -2728,13 +3048,8 @@ def change_detection(
             .clip(region)
         )
 
-        decrease_threshold = (
-            -0.15
-        )
-
-        increase_threshold = (
-            0.15
-        )
+        decrease_threshold = -0.15
+        increase_threshold = 0.15
 
         statistics = (
             ndvi_change
@@ -2742,9 +3057,7 @@ def change_detection(
                 reducer=(
                     ee.Reducer.mean()
                     .combine(
-                        reducer2=(
-                            ee.Reducer.minMax()
-                        ),
+                        reducer2=ee.Reducer.minMax(),
                         sharedInputs=True,
                     )
                 ),
@@ -2753,28 +3066,24 @@ def change_detection(
                 maxPixels=1_000_000,
                 bestEffort=True,
             )
+            .getInfo()
         )
 
-        statistics_info = (
-            statistics.getInfo()
+        statistics = (
+            statistics
+            or {}
         )
 
-        mean_change = (
-            statistics_info.get(
-                "NDVI_CHANGE_mean"
-            )
+        mean_change = statistics.get(
+            "NDVI_CHANGE_mean"
         )
 
-        min_change = (
-            statistics_info.get(
-                "NDVI_CHANGE_min"
-            )
+        min_change = statistics.get(
+            "NDVI_CHANGE_min"
         )
 
-        max_change = (
-            statistics_info.get(
-                "NDVI_CHANGE_max"
-            )
+        max_change = statistics.get(
+            "NDVI_CHANGE_max"
         )
 
         decrease_mask = (
@@ -2793,21 +3102,30 @@ def change_detection(
             .selfMask()
         )
 
-        decrease_result = (
+        decrease_pixels = (
             decrease_mask
             .reduceRegion(
-                reducer=(
-                    ee.Reducer.count()
-                ),
+                reducer=ee.Reducer.count(),
                 geometry=region,
                 scale=10,
                 maxPixels=1_000_000,
                 bestEffort=True,
             )
+            .get(
+                "NDVI_CHANGE"
+            )
+            .getInfo()
         )
 
-        decrease_pixels = (
-            decrease_result
+        increase_pixels = (
+            increase_mask
+            .reduceRegion(
+                reducer=ee.Reducer.count(),
+                geometry=region,
+                scale=10,
+                maxPixels=1_000_000,
+                bestEffort=True,
+            )
             .get(
                 "NDVI_CHANGE"
             )
@@ -2817,38 +3135,12 @@ def change_detection(
         if decrease_pixels is None:
             decrease_pixels = 0
 
-        increase_result = (
-            increase_mask
-            .reduceRegion(
-                reducer=(
-                    ee.Reducer.count()
-                ),
-                geometry=region,
-                scale=10,
-                maxPixels=1_000_000,
-                bestEffort=True,
-            )
-        )
-
-        increase_pixels = (
-            increase_result
-            .get(
-                "NDVI_CHANGE"
-            )
-            .getInfo()
-        )
-
         if increase_pixels is None:
             increase_pixels = 0
 
         ndvi_vis = {
-
-            "min":
-                -0.2,
-
-            "max":
-                0.9,
-
+            "min": -0.2,
+            "max": 0.9,
             "palette": [
                 "8c510a",
                 "d8b365",
@@ -2860,13 +3152,8 @@ def change_detection(
         }
 
         change_vis = {
-
-            "min":
-                -0.5,
-
-            "max":
-                0.5,
-
+            "min": -0.5,
+            "max": 0.5,
             "palette": [
                 "8B0000",
                 "FF0000",
@@ -2882,47 +3169,34 @@ def change_detection(
             ],
         }
 
-        before_map_id = (
+        before_tile_url = (
             before_ndvi
             .getMapId(
                 ndvi_vis
-            )
-        )
-
-        before_tile_url = (
-            before_map_id[
+            )[
                 "tile_fetcher"
             ].url_format
-        )
-
-        after_map_id = (
-            after_ndvi
-            .getMapId(
-                ndvi_vis
-            )
         )
 
         after_tile_url = (
-            after_map_id[
+            after_ndvi
+            .getMapId(
+                ndvi_vis
+            )[
                 "tile_fetcher"
             ].url_format
         )
 
-        change_map_id = (
+        change_tile_url = (
             ndvi_change
             .getMapId(
                 change_vis
-            )
-        )
-
-        change_tile_url = (
-            change_map_id[
+            )[
                 "tile_fetcher"
             ].url_format
         )
 
         response = {
-
             "status":
                 "success",
 
@@ -2933,7 +3207,6 @@ def change_detection(
                 gee_project,
 
             "location": {
-
                 "latitude":
                     req.latitude,
 
@@ -2945,7 +3218,6 @@ def change_detection(
             },
 
             "before": {
-
                 "date":
                     req.before_date,
 
@@ -2960,7 +3232,6 @@ def change_detection(
             },
 
             "after": {
-
                 "date":
                     req.after_date,
 
@@ -2975,7 +3246,6 @@ def change_detection(
             },
 
             "change": {
-
                 "method":
                     (
                         "After median NDVI "
@@ -3006,25 +3276,12 @@ def change_detection(
                 "tile_url":
                     change_tile_url,
 
-                "visualization": {
-
-                    "min":
-                        -0.5,
-
-                    "max":
-                        0.5,
-
-                    "palette":
-                        change_vis[
-                            "palette"
-                        ],
-                },
+                "visualization":
+                    change_vis,
             },
 
             "layers": [
-
                 {
-
                     "id":
                         "before_ndvi",
 
@@ -3048,7 +3305,6 @@ def change_detection(
                 },
 
                 {
-
                     "id":
                         "after_ndvi",
 
@@ -3072,7 +3328,6 @@ def change_detection(
                 },
 
                 {
-
                     "id":
                         "ndvi_change",
 
@@ -3102,24 +3357,14 @@ def change_detection(
             ],
 
             "interpretation": {
-
                 "note":
                     (
                         "NDVI change represents the "
                         "difference between the after "
-                        "and before vegetation index. "
-                        "Red areas indicate vegetation "
-                        "decrease, white/yellow areas "
-                        "indicate relatively small "
-                        "changes, and green areas indicate "
-                        "vegetation increase. NDVI change "
-                        "alone should not be interpreted "
-                        "as proof of deforestation or a "
-                        "specific land-use change."
+                        "and before vegetation index."
                     ),
 
                 "legend": {
-
                     "decrease":
                         "NDVI change < -0.15",
 
@@ -3152,6 +3397,15 @@ def change_detection(
                 f"{type(exc).__name__}: {exc}"
             ),
         )
+
+    finally:
+
+        try:
+            EE_REQUEST_LOCK.release()
+        except Exception:
+            pass
+
+        force_memory_cleanup()
 
 
 # ============================================================
@@ -3206,7 +3460,6 @@ def mask_s2_clouds_agb(
     )
 
     cloud_bit_mask = 1 << 10
-
     cirrus_bit_mask = 1 << 11
 
     mask = (
@@ -3238,20 +3491,16 @@ def get_yearly_gedi_agbd(
     year,
 ):
 
-    start_date = (
-        ee.Date.fromYMD(
-            year,
-            1,
-            1,
-        )
+    start_date = ee.Date.fromYMD(
+        year,
+        1,
+        1,
     )
 
-    end_date = (
-        ee.Date.fromYMD(
-            year + 1,
-            1,
-            1,
-        )
+    end_date = ee.Date.fromYMD(
+        year + 1,
+        1,
+        1,
     )
 
     collection = (
@@ -3274,45 +3523,43 @@ def get_yearly_gedi_agbd(
         or 0
     )
 
+    empty = {
+        "year":
+            year,
+
+        "agbd_mg_ha":
+            None,
+
+        "agbd_median_mg_ha":
+            None,
+
+        "agbd_min_mg_ha":
+            None,
+
+        "agbd_max_mg_ha":
+            None,
+
+        "image_count":
+            raw_image_count,
+
+        "valid_pixel_count":
+            0,
+
+        "available":
+            False,
+    }
+
     if raw_image_count == 0:
 
-        return {
+        empty["reason"] = (
+            "No GEDI L4A monthly scenes "
+            "intersected the requested region "
+            "and year."
+        )
 
-            "year":
-                year,
+        return empty
 
-            "agbd_mg_ha":
-                None,
-
-            "agbd_median_mg_ha":
-                None,
-
-            "agbd_min_mg_ha":
-                None,
-
-            "agbd_max_mg_ha":
-                None,
-
-            "image_count":
-                0,
-
-            "valid_pixel_count":
-                0,
-
-            "available":
-                False,
-
-            "reason":
-                (
-                    "No GEDI L4A monthly scenes "
-                    "intersected the requested region "
-                    "and year."
-                ),
-        }
-
-    def quality_mask(
-        image,
-    ):
+    def quality_mask(image):
 
         l4_quality = (
             image
@@ -3376,51 +3623,22 @@ def get_yearly_gedi_agbd(
             )
         )
 
-    except Exception as mosaic_error:
+    except Exception as exc:
 
         print(
-            "GEDI mosaic creation failed:"
+            "[GEDI] Mosaic creation failed:",
+            exc,
         )
 
-        print(
-            mosaic_error
+        empty["reason"] = (
+            "GEDI scenes were found, "
+            "but a valid AGBD mosaic "
+            "could not be created."
         )
 
-        return {
+        return empty
 
-            "year":
-                year,
-
-            "agbd_mg_ha":
-                None,
-
-            "agbd_median_mg_ha":
-                None,
-
-            "agbd_min_mg_ha":
-                None,
-
-            "agbd_max_mg_ha":
-                None,
-
-            "image_count":
-                raw_image_count,
-
-            "valid_pixel_count":
-                0,
-
-            "available":
-                False,
-
-            "reason":
-                (
-                    "GEDI scenes were found, "
-                    "but a valid AGBD mosaic "
-                    "could not be created."
-                ),
-        }
-
-    valid_count_result = (
+    valid_count_info = (
         yearly_agbd
         .reduceRegion(
             reducer=ee.Reducer.count(),
@@ -3429,10 +3647,6 @@ def get_yearly_gedi_agbd(
             bestEffort=True,
             maxPixels=1_000_000_000,
         )
-    )
-
-    valid_count_info = (
-        valid_count_result
         .getInfo()
         or {}
     )
@@ -3441,59 +3655,25 @@ def get_yearly_gedi_agbd(
         valid_count_info.get(
             "agbd"
         )
+        or 0
     )
 
-    if valid_pixel_count is None:
-        valid_pixel_count = 0
-
     try:
-
         valid_pixel_count = int(
             valid_pixel_count
         )
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-
+    except Exception:
         valid_pixel_count = 0
 
     if valid_pixel_count <= 0:
 
-        return {
+        empty["reason"] = (
+            "GEDI scenes intersected the region, "
+            "but no valid quality-filtered AGBD "
+            "pixels were available."
+        )
 
-            "year":
-                year,
-
-            "agbd_mg_ha":
-                None,
-
-            "agbd_median_mg_ha":
-                None,
-
-            "agbd_min_mg_ha":
-                None,
-
-            "agbd_max_mg_ha":
-                None,
-
-            "image_count":
-                raw_image_count,
-
-            "valid_pixel_count":
-                0,
-
-            "available":
-                False,
-
-            "reason":
-                (
-                    "GEDI scenes intersected the region, "
-                    "but no valid quality-filtered AGBD "
-                    "pixels were available."
-                ),
-        }
+        return empty
 
     stats = (
         yearly_agbd
@@ -3518,124 +3698,68 @@ def get_yearly_gedi_agbd(
         or {}
     )
 
-    agbd_mean = (
+    def as_float(value):
+
+        try:
+            return (
+                float(value)
+                if value is not None
+                else None
+            )
+        except Exception:
+            return None
+
+    agbd_mean = as_float(
         stats.get(
             "agbd_mean"
         )
     )
 
-    agbd_median = (
+    agbd_median = as_float(
         stats.get(
             "agbd_median"
         )
     )
 
-    agbd_min = (
+    agbd_min = as_float(
         stats.get(
             "agbd_min"
         )
     )
 
-    agbd_max = (
+    agbd_max = as_float(
         stats.get(
             "agbd_max"
         )
     )
 
-    try:
-
-        agbd_mean = (
-            float(agbd_mean)
-            if agbd_mean is not None
-            else None
-        )
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-
-        agbd_mean = None
-
-    try:
-
-        agbd_median = (
-            float(agbd_median)
-            if agbd_median is not None
-            else None
-        )
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-
-        agbd_median = None
-
-    try:
-
-        agbd_min = (
-            float(agbd_min)
-            if agbd_min is not None
-            else None
-        )
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-
-        agbd_min = None
-
-    try:
-
-        agbd_max = (
-            float(agbd_max)
-            if agbd_max is not None
-            else None
-        )
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-
-        agbd_max = None
-
     if agbd_mean is None:
 
-        return {
+        empty.update(
+            {
+                "agbd_median_mg_ha":
+                    agbd_median,
 
-            "year":
-                year,
+                "agbd_min_mg_ha":
+                    agbd_min,
 
-            "agbd_mg_ha":
-                None,
+                "agbd_max_mg_ha":
+                    agbd_max,
 
-            "agbd_median_mg_ha":
-                agbd_median,
+                "valid_pixel_count":
+                    valid_pixel_count,
 
-            "agbd_min_mg_ha":
-                agbd_min,
+                "reason":
+                    (
+                        "No numeric AGBD mean "
+                        "was returned by Earth Engine."
+                    ),
+            }
+        )
 
-            "agbd_max_mg_ha":
-                agbd_max,
-
-            "image_count":
-                raw_image_count,
-
-            "valid_pixel_count":
-                valid_pixel_count,
-
-            "available":
-                False,
-
-            "reason":
-                "No numeric AGBD mean was returned by Earth Engine.",
-        }
+        return empty
 
     return {
-
         "year":
             year,
 
@@ -3682,11 +3806,8 @@ def find_gedi_year_result(
     search_radii = []
 
     candidates = [
-
         requested_radius_m,
-
         requested_radius_m * 2,
-
         5000,
     ]
 
@@ -3700,15 +3821,12 @@ def find_gedi_year_result(
         if radius < 100:
             radius = 100.0
 
-        duplicate = any(
+        if not any(
             abs(
                 existing - radius
             ) < 1
             for existing in search_radii
-        )
-
-        if not duplicate:
-
+        ):
             search_radii.append(
                 radius
             )
@@ -3752,7 +3870,7 @@ def find_gedi_year_result(
 
 
 # ============================================================
-# SENTINEL-2 RGB COMPOSITE
+# SENTINEL-2 YEARLY RGB
 # ============================================================
 
 def get_yearly_sentinel_rgb(
@@ -3761,20 +3879,16 @@ def get_yearly_sentinel_rgb(
     max_cloud_pct,
 ):
 
-    start_date = (
-        ee.Date.fromYMD(
-            year,
-            1,
-            1,
-        )
+    start_date = ee.Date.fromYMD(
+        year,
+        1,
+        1,
     )
 
-    end_date = (
-        ee.Date.fromYMD(
-            year + 1,
-            1,
-            1,
-        )
+    end_date = ee.Date.fromYMD(
+        year + 1,
+        1,
+        1,
     )
 
     collection = (
@@ -3809,7 +3923,6 @@ def get_yearly_sentinel_rgb(
     if scene_count == 0:
 
         return {
-
             "tile_url":
                 None,
 
@@ -3826,18 +3939,13 @@ def get_yearly_sentinel_rgb(
     )
 
     visualization = {
-
         "bands": [
             "B4",
             "B3",
             "B2",
         ],
-
-        "min":
-            0.0,
-
-        "max":
-            0.3,
+        "min": 0.0,
+        "max": 0.3,
     }
 
     map_id = (
@@ -3847,16 +3955,11 @@ def get_yearly_sentinel_rgb(
         )
     )
 
-    tile_url = (
-        map_id[
-            "tile_fetcher"
-        ].url_format
-    )
-
     return {
-
         "tile_url":
-            tile_url,
+            map_id[
+                "tile_fetcher"
+            ].url_format,
 
         "scene_count":
             scene_count,
@@ -3864,7 +3967,7 @@ def get_yearly_sentinel_rgb(
 
 
 # ============================================================
-# SATELLITE AGB ANALYSIS
+# SATELLITE AGB
 # ============================================================
 
 @app.post(
@@ -3873,6 +3976,20 @@ def get_yearly_sentinel_rgb(
 def satellite_agb_analysis(
     req: SatelliteAGBRequest,
 ):
+
+    acquired = EE_REQUEST_LOCK.acquire(
+        timeout=120
+    )
+
+    if not acquired:
+
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Earth Engine is busy processing "
+                "another request."
+            ),
+        )
 
     try:
 
@@ -3891,7 +4008,6 @@ def satellite_agb_analysis(
         historical = []
 
         search_radius_by_year = {}
-
         search_region_by_year = {}
 
         for current_year in range(
@@ -3913,7 +4029,6 @@ def satellite_agb_analysis(
             if year_result is None:
 
                 year_result = {
-
                     "year":
                         current_year,
 
@@ -3944,8 +4059,7 @@ def satellite_agb_analysis(
                     "reason":
                         (
                             "No valid GEDI L4A "
-                            "AGBD observation was found "
-                            "within the available search radii."
+                            "AGBD observation was found."
                         ),
                 }
 
@@ -3972,7 +4086,8 @@ def satellite_agb_analysis(
                 )
                 and item.get(
                     "agbd_mg_ha"
-                ) is not None
+                )
+                is not None
             )
         ]
 
@@ -4060,7 +4175,6 @@ def satellite_agb_analysis(
         else:
 
             selected_year_result = {
-
                 "year":
                     req.year,
 
@@ -4088,20 +4202,13 @@ def satellite_agb_analysis(
                 "reason":
                     (
                         "No valid GEDI L4A "
-                        "AGBD observations were found "
-                        "from 2019 through the requested year."
+                        "AGBD observations were found."
                     ),
             }
 
             effective_year = None
-
-            effective_region = (
-                requested_region
-            )
-
-            effective_radius = (
-                req.radius_m
-            )
+            effective_region = requested_region
+            effective_radius = req.radius_m
 
         selected_agb = (
             selected_year_result.get(
@@ -4143,7 +4250,6 @@ def satellite_agb_analysis(
                 )
 
         change_absolute = None
-
         change_percent = None
 
         if (
@@ -4175,10 +4281,8 @@ def satellite_agb_analysis(
                 )
 
                 change_percent = (
-                    (
-                        change_absolute
-                        / previous_value
-                    )
+                    change_absolute
+                    / previous_value
                     * 100
                 )
 
@@ -4201,15 +4305,12 @@ def satellite_agb_analysis(
             sentinel.get(
                 "scene_count",
                 0,
-            )
-            == 0
+            ) == 0
             and effective_year is not None
             and effective_year != req.year
         ):
 
-            sentinel_year = (
-                effective_year
-            )
+            sentinel_year = effective_year
 
             sentinel = (
                 get_yearly_sentinel_rgb(
@@ -4220,7 +4321,6 @@ def satellite_agb_analysis(
             )
 
         response = {
-
             "status":
                 "success",
 
@@ -4228,7 +4328,6 @@ def satellite_agb_analysis(
                 gee_project,
 
             "location": {
-
                 "latitude":
                     req.latitude,
 
@@ -4252,7 +4351,6 @@ def satellite_agb_analysis(
                 effective_year,
 
             "selected_year": {
-
                 "year":
                     selected_year_result.get(
                         "year"
@@ -4313,7 +4411,6 @@ def satellite_agb_analysis(
             },
 
             "latest_available": {
-
                 "year":
                     (
                         latest_available[
@@ -4328,51 +4425,12 @@ def satellite_agb_analysis(
                         latest_available[
                             "agbd_mg_ha"
                         ]
-                        if latest_available
-                        else None
-                    ),
-
-                "image_count":
-                    (
-                        latest_available.get(
-                            "image_count",
-                            0,
-                        )
-                        if latest_available
-                        else 0
-                    ),
-
-                "valid_pixel_count":
-                    (
-                        latest_available.get(
-                            "valid_pixel_count",
-                            0,
-                        )
-                        if latest_available
-                        else 0
-                    ),
-
-                "search_radius_m":
-                    (
-                        latest_available.get(
-                            "search_radius_m"
-                        )
-                        if latest_available
-                        else None
-                    ),
-
-                "agbd_median_mg_ha":
-                    (
-                        latest_available.get(
-                            "agbd_median_mg_ha"
-                        )
                         if latest_available
                         else None
                     ),
             },
 
             "previous_available": {
-
                 "year":
                     (
                         previous_available[
@@ -4390,39 +4448,9 @@ def satellite_agb_analysis(
                         if previous_available
                         else None
                     ),
-
-                "image_count":
-                    (
-                        previous_available.get(
-                            "image_count",
-                            0,
-                        )
-                        if previous_available
-                        else 0
-                    ),
-
-                "valid_pixel_count":
-                    (
-                        previous_available.get(
-                            "valid_pixel_count",
-                            0,
-                        )
-                        if previous_available
-                        else 0
-                    ),
-
-                "search_radius_m":
-                    (
-                        previous_available.get(
-                            "search_radius_m"
-                        )
-                        if previous_available
-                        else None
-                    ),
             },
 
             "change": {
-
                 "from_year":
                     (
                         previous_available[
@@ -4455,7 +4483,6 @@ def satellite_agb_analysis(
                 available_years,
 
             "satellite": {
-
                 "collection":
                     "COPERNICUS/S2_SR_HARMONIZED",
 
@@ -4475,14 +4502,11 @@ def satellite_agb_analysis(
             },
 
             "analysis": {
-
                 "method":
                     (
                         "Quality-filtered GEDI L4A "
                         "aboveground biomass density "
-                        "from actual valid GEDI observations "
-                        "inside an automatically expanded "
-                        "search region."
+                        "from actual valid GEDI observations."
                     ),
 
                 "agb_unit":
@@ -4505,21 +4529,10 @@ def satellite_agb_analysis(
                 "fallback_enabled":
                     True,
 
-                "fallback_description":
-                    (
-                        "When the requested year has no "
-                        "valid GEDI observation, the nearest "
-                        "available GEDI observation year "
-                        "between 2019 and the requested year "
-                        "is returned and explicitly marked "
-                        "as a fallback."
-                    ),
-
                 "data_policy":
                     (
                         "Only actual GEDI observations "
-                        "are returned. Missing values are "
-                        "not fabricated or interpolated."
+                        "are returned."
                     ),
             },
         }
@@ -4542,3 +4555,66 @@ def satellite_agb_analysis(
                 f"{type(exc).__name__}: {exc}"
             ),
         )
+
+    finally:
+
+        try:
+            EE_REQUEST_LOCK.release()
+        except Exception:
+            pass
+
+        force_memory_cleanup()
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+@app.on_event("startup")
+def startup():
+
+    ensure_directories()
+
+    print(
+        "============================================"
+    )
+
+    print(
+        "SYLVASENSE BACKEND STARTED"
+    )
+
+    print(
+        f"Version: {APP_VERSION}"
+    )
+
+    print(
+        f"DeepForest enabled: {ENABLE_DEEPFOREST}"
+    )
+
+    print(
+        "Earth Engine service-account configured:",
+        bool(
+            os.getenv(
+                "GEE_SERVICE_ACCOUNT"
+            )
+            and os.getenv(
+                "GEE_PRIVATE_KEY"
+            )
+        ),
+    )
+
+    print(
+        "Supabase configured:",
+        bool(
+            os.getenv(
+                "SUPABASE_URL"
+            )
+            and os.getenv(
+                "SUPABASE_SERVICE_ROLE_KEY"
+            )
+        ),
+    )
+
+    print(
+        "============================================"
+    )
