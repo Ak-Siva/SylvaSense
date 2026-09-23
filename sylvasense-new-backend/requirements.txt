@@ -8,6 +8,7 @@ pillow
 matplotlib
 scikit-learn
 scikit-image
+pytorch-lightning
 earthengine-api
 geopandas
 shapely
