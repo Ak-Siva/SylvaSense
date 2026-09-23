@@ -1108,20 +1108,58 @@ def run_image_analysis_job(
     try:
 
         # ----------------------------------------------------
+        # START JOB IMMEDIATELY
+        # ----------------------------------------------------
+
+        update_image_job(
+            job_id,
+            1,
+            "Starting analysis",
+            "Image analysis worker started.",
+        )
+
+        print(
+            f"[IMAGE ANALYSIS] Starting job: {job_id}"
+        )
+
+        # ----------------------------------------------------
         # IMPORT HEAVY MODULES ONLY WHEN REQUIRED
         # ----------------------------------------------------
+
+        update_image_job(
+            job_id,
+            3,
+            "Loading analysis modules",
+            "Loading tree detection and biomass modules...",
+        )
+
+        print(
+            "[IMAGE ANALYSIS] Importing tree_detection..."
+        )
 
         from tree_detection import (
             detect_trees,
             compute_crown_metrics,
         )
 
+        print(
+            "[IMAGE ANALYSIS] Importing crown_segmentation..."
+        )
+
         from crown_segmentation import (
             segment_tree_crowns,
         )
 
+        print(
+            "[IMAGE ANALYSIS] Importing biomass..."
+        )
+
         from biomass import (
             per_tree_biomass_pipeline,
+        )
+
+        print(
+            "[IMAGE ANALYSIS] All analysis modules loaded."
         )
 
         # ----------------------------------------------------
@@ -1146,8 +1184,16 @@ def run_image_analysis_job(
             "Loading the DeepForest tree detection model...",
         )
 
+        print(
+            "[IMAGE ANALYSIS] Loading DeepForest model..."
+        )
+
         model = (
             get_deepforest_model()
+        )
+
+        print(
+            "[IMAGE ANALYSIS] DeepForest model loaded."
         )
 
         update_image_job(
@@ -1168,12 +1214,20 @@ def run_image_analysis_job(
             "Detecting individual trees with DeepForest...",
         )
 
+        print(
+            "[IMAGE ANALYSIS] Starting tree detection..."
+        )
+
         predictions = detect_trees(
             model,
             temp_path,
             patch_size=400,
             patch_overlap=0.25,
             iou_threshold=0.15,
+        )
+
+        print(
+            "[IMAGE ANALYSIS] Tree detection returned."
         )
 
         predictions = (
@@ -1185,6 +1239,10 @@ def run_image_analysis_job(
 
         tree_count = len(
             predictions
+        )
+
+        print(
+            f"[IMAGE ANALYSIS] Detected {tree_count} trees."
         )
 
         # ----------------------------------------------------
@@ -1634,11 +1692,37 @@ async def image_analyze(
             file.filename
         )
 
-        background_tasks.add_task(
-            run_image_analysis_job,
+        # Mark the job as running before starting the worker.
+        # This prevents the frontend from remaining at
+        # "Queued" if the Render background-task scheduler
+        # delays execution.
+        update_image_job(
             job_id,
-            temp_path,
-            file.filename,
+            1,
+            "Starting analysis",
+            "Starting image analysis worker...",
+        )
+
+        print(
+            f"[IMAGE ANALYSIS] Queuing job {job_id} "
+            f"for {file.filename}"
+        )
+
+        worker = threading.Thread(
+            target=run_image_analysis_job,
+            args=(
+                job_id,
+                temp_path,
+                file.filename,
+            ),
+            daemon=True,
+            name=f"sylvasense-image-{job_id[:8]}",
+        )
+
+        worker.start()
+
+        print(
+            f"[IMAGE ANALYSIS] Worker started for job {job_id}"
         )
 
         return {
@@ -1653,13 +1737,13 @@ async def image_analyze(
                 file.filename,
 
             "progress":
-                0,
+                1,
 
             "stage":
-                "Queued",
+                "Starting analysis",
 
             "message":
-                "Image analysis started.",
+                "Image analysis worker started.",
         }
 
     except Exception as exc:
