@@ -6,35 +6,67 @@ Uses DeepForest for real individual tree crown detection.
 
 This version also exposes REAL DeepForest prediction progress.
 
-Example:
+IMPORTANT MEMORY OPTIMIZATION
+-----------------------------
+Heavy dependencies such as:
 
-    DeepForest:
-        Predicting 68/130
+    DeepForest
+    PyTorch Lightning
+    Matplotlib
 
-    Callback:
-        current = 68
-        total = 130
-        percentage = 52.3%
+are imported lazily.
 
-The progress callback is optional, so existing code can still call:
+This allows the FastAPI service to start with much lower memory
+usage on memory-limited hosting such as Render.
 
-    detect_trees(model, image_path)
-
-without any changes.
+The actual DeepForest model is still loaded only when required.
 """
-
-from deepforest import main
-from deepforest import get_data
 
 import pandas as pd
 import numpy as np
 
 from PIL import Image
 
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
 
-import pytorch_lightning as pl
+# ============================================================
+# LAZY DEEPFOREST IMPORT
+# ============================================================
+
+def get_deepforest_main():
+    """
+    Import DeepForest only when the model is actually needed.
+    """
+
+    from deepforest import main
+
+    return main
+
+
+def get_deepforest_data():
+    """
+    Import DeepForest sample-data helper only when needed.
+    """
+
+    from deepforest import get_data
+
+    return get_data
+
+
+# ============================================================
+# LAZY MATPLOTLIB IMPORT
+# ============================================================
+
+def get_matplotlib():
+    """
+    Import Matplotlib only when visualization is requested.
+
+    Matplotlib is intentionally NOT imported during API startup.
+    """
+
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+
+    return plt, patches
 
 
 # ============================================================
@@ -45,6 +77,12 @@ def load_model():
     """
     Load the real pretrained DeepForest tree-crown model.
     """
+
+    print(
+        "Loading DeepForest model..."
+    )
+
+    main = get_deepforest_main()
 
     model = main.deepforest()
 
@@ -65,102 +103,177 @@ def load_model():
 # DEEPFOREST REAL PROGRESS CALLBACK
 # ============================================================
 
-class DeepForestProgressCallback(pl.Callback):
+def DeepForestProgressCallback(
+    total_batches,
+    progress_callback=None,
+):
     """
-    Tracks the actual DeepForest prediction batches.
+    Create the real DeepForest prediction callback.
 
-    DeepForest internally calls:
+    PyTorch Lightning is imported ONLY when this function is
+    called during an actual prediction.
 
-        trainer.predict(...)
+    This preserves the existing API:
 
-    for tiled prediction.
+        DeepForestProgressCallback(
+            total_batches=130,
+            progress_callback=callback,
+        )
 
-    Lightning calls on_predict_batch_end()
-    after each completed prediction batch.
-
-    We convert:
-
-        current / total
-
-    into a percentage in api_server.py.
+    Returns
+    -------
+    pytorch_lightning.Callback
+        A real Lightning callback instance.
     """
 
-    def __init__(
-        self,
-        total_batches,
-        progress_callback=None,
-    ):
-        super().__init__()
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # Do NOT import PyTorch Lightning at module startup.
+    # --------------------------------------------------------
 
-        self.total_batches = max(
-            int(total_batches),
-            1,
-        )
+    import pytorch_lightning as pl
 
-        self.progress_callback = (
-            progress_callback
-        )
+    # --------------------------------------------------------
+    # Real Lightning callback class
+    # --------------------------------------------------------
 
-        self.completed_batches = 0
-
-    def on_predict_start(
-        self,
-        trainer,
-        pl_module,
+    class _DeepForestProgressCallback(
+        pl.Callback
     ):
         """
-        Called when DeepForest prediction starts.
+        Tracks actual DeepForest prediction batches.
+
+        Lightning calls:
+
+            on_predict_start()
+            on_predict_batch_end()
+            on_predict_end()
+
+        during DeepForest prediction.
         """
 
-        self.completed_batches = 0
+        def __init__(
+            self,
+            total_batches,
+            progress_callback=None,
+        ):
+            super().__init__()
 
-        if self.progress_callback:
-            self.progress_callback(
-                0,
+            self.total_batches = max(
+                int(total_batches),
+                1,
+            )
+
+            self.progress_callback = (
+                progress_callback
+            )
+
+            self.completed_batches = 0
+
+        def on_predict_start(
+            self,
+            trainer,
+            pl_module,
+        ):
+            """
+            Called when DeepForest prediction starts.
+            """
+
+            self.completed_batches = 0
+
+            print(
+                "DeepForest prediction started: "
+                f"0/{self.total_batches}"
+            )
+
+            if self.progress_callback:
+
+                self.progress_callback(
+                    0,
+                    self.total_batches,
+                )
+
+        def on_predict_batch_end(
+            self,
+            trainer,
+            pl_module,
+            outputs,
+            batch,
+            batch_idx,
+            dataloader_idx=0,
+        ):
+            """
+            Called after every completed DeepForest
+            prediction batch.
+            """
+
+            self.completed_batches += 1
+
+            current = min(
+                self.completed_batches,
                 self.total_batches,
             )
 
-    def on_predict_batch_end(
-        self,
-        trainer,
-        pl_module,
-        outputs,
-        batch,
-        batch_idx,
-        dataloader_idx=0,
-    ):
-        """
-        Called after every completed DeepForest
-        prediction batch.
-        """
-
-        self.completed_batches += 1
-
-        current = min(
-            self.completed_batches,
-            self.total_batches,
-        )
-
-        if self.progress_callback:
-            self.progress_callback(
-                current,
-                self.total_batches,
+            percentage = (
+                current
+                / self.total_batches
+                * 100.0
             )
 
-    def on_predict_end(
-        self,
-        trainer,
-        pl_module,
-    ):
-        """
-        Ensure the final state reaches total / total.
-        """
-
-        if self.progress_callback:
-            self.progress_callback(
-                self.total_batches,
-                self.total_batches,
+            percentage = min(
+                max(
+                    percentage,
+                    0.0,
+                ),
+                100.0,
             )
+
+            print(
+                "DeepForest: Predicting "
+                f"{current}/"
+                f"{self.total_batches} "
+                f"({percentage:.1f}%)"
+            )
+
+            if self.progress_callback:
+
+                self.progress_callback(
+                    current,
+                    self.total_batches,
+                )
+
+        def on_predict_end(
+            self,
+            trainer,
+            pl_module,
+        ):
+            """
+            Ensure the final state reaches total / total.
+            """
+
+            if self.progress_callback:
+
+                self.progress_callback(
+                    self.total_batches,
+                    self.total_batches,
+                )
+
+            print(
+                "DeepForest prediction completed: "
+                f"{self.total_batches}/"
+                f"{self.total_batches} "
+                "(100.0%)"
+            )
+
+    # --------------------------------------------------------
+    # Return actual Lightning callback instance
+    # --------------------------------------------------------
+
+    return _DeepForestProgressCallback(
+        total_batches=total_batches,
+        progress_callback=progress_callback,
+    )
 
 
 # ============================================================
@@ -300,6 +413,7 @@ def detect_trees(
     """
 
     if model is None:
+
         raise ValueError(
             "DeepForest model is not loaded."
         )
@@ -318,6 +432,7 @@ def detect_trees(
         )
 
         if predictions is None:
+
             predictions = pd.DataFrame()
 
         print(
@@ -369,6 +484,7 @@ def detect_trees(
         )
 
         if predictions is None:
+
             predictions = pd.DataFrame()
 
         return predictions
@@ -379,7 +495,7 @@ def detect_trees(
     )
 
     # ========================================================
-    # CREATE CALLBACK
+    # CREATE REAL LIGHTNING CALLBACK
     # ========================================================
 
     progress_callback_object = (
@@ -414,7 +530,7 @@ def detect_trees(
         #
         # We still use DeepForest's own predict_tile().
         #
-        # The callback receives the real prediction batch
+        # The callback receives the REAL prediction batch
         # completion events from trainer.predict().
         # ====================================================
 
@@ -442,6 +558,7 @@ def detect_trees(
     # ========================================================
 
     if predictions is None:
+
         predictions = pd.DataFrame()
 
     # ========================================================
@@ -474,6 +591,7 @@ def compute_crown_metrics(
     """
 
     if predictions is None:
+
         return pd.DataFrame()
 
     predictions = predictions.copy()
@@ -555,7 +673,16 @@ def visualize_detections(
 ):
     """
     Draw DeepForest bounding boxes over the input image.
+
+    Matplotlib is imported ONLY when this visualization
+    function is actually called.
     """
+
+    # --------------------------------------------------------
+    # Lazy Matplotlib import
+    # --------------------------------------------------------
+
+    plt, patches = get_matplotlib()
 
     img = Image.open(
         image_path
@@ -622,6 +749,12 @@ def visualize_detections(
 
 if __name__ == "__main__":
 
+    # --------------------------------------------------------
+    # DeepForest sample data is also lazy-loaded.
+    # --------------------------------------------------------
+
+    get_data = get_deepforest_data()
+
     sample_image = get_data(
         "OSBS_029.tif"
     )
@@ -636,7 +769,9 @@ if __name__ == "__main__":
         current,
         total,
     ):
+
         if total <= 0:
+
             return
 
         percentage = (

@@ -6,7 +6,6 @@ pydantic
 numpy
 pandas
 pillow
-matplotlib
 
 scikit-learn
 scikit-image
