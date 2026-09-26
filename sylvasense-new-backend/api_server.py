@@ -1,26 +1,28 @@
+# ============================================================
+# SYLVASENSE EARTH ENGINE BACKEND
+# Render deployment
+#
+# Handles:
+#   - Earth Engine authentication
+#   - Sentinel-1
+#   - Sentinel-2
+#   - NDVI
+#   - GEDI
+#   - Satellite AGB
+#   - AGB forecasting
+#   - Change detection
+#
+# DeepForest / image analysis is deployed separately.
+# ============================================================
+
 from pathlib import Path
-from functools import lru_cache
 
-from fastapi import (
-    FastAPI,
-    UploadFile,
-    File,
-    HTTPException,
-    BackgroundTasks,
-)
-
-from pydantic import BaseModel, Field
-from fastapi.middleware.cors import CORSMiddleware
-
-import tempfile
 import os
 import json
 import traceback
-import uuid
 import math
 import base64
 import urllib.request
-import threading
 
 import numpy as np
 import pandas as pd
@@ -29,19 +31,14 @@ import ee
 
 from google.oauth2 import service_account
 
-from tree_detection import (
-    load_model,
-    detect_trees,
-    compute_crown_metrics,
+from fastapi import (
+    FastAPI,
+    HTTPException,
 )
 
-from crown_segmentation import (
-    segment_tree_crowns,
-)
+from pydantic import BaseModel, Field
 
-from biomass import (
-    per_tree_biomass_pipeline,
-)
+from fastapi.middleware.cors import CORSMiddleware
 
 from agb_forecasting import (
     forecast_agb,
@@ -64,13 +61,13 @@ from lidar_gedi import (
 # ============================================================
 
 app = FastAPI(
-    title="SYLVASENSE Backend",
+    title="SYLVASENSE Earth Engine Backend",
     version="1.5.0",
     description=(
         "SYLVASENSE Earth Observation platform with "
-        "tree detection, crown segmentation, biomass, "
-        "AGB analysis, Sentinel-1/Sentinel-2, "
-        "NDVI, GEDI and change detection."
+        "Sentinel-1/Sentinel-2, NDVI, GEDI, satellite "
+        "aboveground biomass, AGB forecasting and "
+        "change detection."
     ),
 )
 
@@ -89,170 +86,30 @@ app.add_middleware(
 
 
 # ============================================================
-# DEEPFOREST MODEL
-# ============================================================
-
-@lru_cache(maxsize=1)
-def get_deepforest_model():
-    return load_model()
-
-
-# ============================================================
-# IMAGE ANALYSIS JOB STORAGE
-#
-# Each uploaded image receives a job_id.
-#
-# The frontend polls:
-#
-# GET /api/image-analysis-progress/{job_id}
-#
-# ============================================================
-
-_image_jobs = {}
-
-_image_jobs_lock = threading.Lock()
-
-
-def create_image_job(filename):
-    job_id = uuid.uuid4().hex
-
-    with _image_jobs_lock:
-
-        _image_jobs[job_id] = {
-            "job_id": job_id,
-            "filename": filename,
-            "status": "queued",
-            "progress": 0,
-            "stage": "Queued",
-            "message": "Image analysis is queued.",
-            "result": None,
-            "error": None,
-        }
-
-    return job_id
-
-
-def update_image_job(
-    job_id,
-    progress,
-    stage,
-    message,
-):
-    with _image_jobs_lock:
-
-        job = _image_jobs.get(
-            job_id
-        )
-
-        if job is None:
-            return
-
-        progress = int(
-            max(
-                0,
-                min(
-                    100,
-                    progress,
-                ),
-            )
-        )
-
-        job["progress"] = progress
-        job["stage"] = stage
-        job["message"] = message
-
-        if progress >= 100:
-
-            job["status"] = "completed"
-
-        elif progress > 0:
-
-            job["status"] = "running"
-
-
-def complete_image_job(
-    job_id,
-    result,
-):
-    with _image_jobs_lock:
-
-        job = _image_jobs.get(
-            job_id
-        )
-
-        if job is None:
-            return
-
-        job["progress"] = 100
-
-        job["status"] = "completed"
-
-        job["stage"] = "Complete"
-
-        job["message"] = (
-            "Image analysis completed successfully."
-        )
-
-        job["result"] = result
-
-        job["error"] = None
-
-
-def fail_image_job(
-    job_id,
-    error,
-):
-    with _image_jobs_lock:
-
-        job = _image_jobs.get(
-            job_id
-        )
-
-        if job is None:
-            return
-
-        job["status"] = "failed"
-
-        job["stage"] = "Failed"
-
-        job["message"] = str(
-            error
-        )
-
-        job["error"] = str(
-            error
-        )
-
-
-# ============================================================
 # JSON SERIALIZATION
 # ============================================================
 
 def make_json_safe(obj):
 
     if isinstance(obj, dict):
-
         return {
             str(key): make_json_safe(value)
             for key, value in obj.items()
         }
 
     if isinstance(obj, list):
-
         return [
             make_json_safe(value)
             for value in obj
         ]
 
     if isinstance(obj, tuple):
-
         return [
             make_json_safe(value)
             for value in obj
         ]
 
     if isinstance(obj, pd.DataFrame):
-
         return make_json_safe(
             obj.to_dict(
                 orient="records"
@@ -260,19 +117,16 @@ def make_json_safe(obj):
         )
 
     if isinstance(obj, pd.Series):
-
         return make_json_safe(
             obj.to_dict()
         )
 
     if isinstance(obj, np.ndarray):
-
         return make_json_safe(
             obj.tolist()
         )
 
     if isinstance(obj, np.integer):
-
         return int(obj)
 
     if isinstance(obj, np.floating):
@@ -283,13 +137,11 @@ def make_json_safe(obj):
             math.isnan(value)
             or math.isinf(value)
         ):
-
             return None
 
         return value
 
     if isinstance(obj, np.bool_):
-
         return bool(obj)
 
     if isinstance(obj, float):
@@ -298,7 +150,6 @@ def make_json_safe(obj):
             math.isnan(obj)
             or math.isinf(obj)
         ):
-
             return None
 
         return obj
@@ -307,7 +158,6 @@ def make_json_safe(obj):
         obj,
         (str, int, bool),
     ):
-
         return obj
 
     try:
@@ -321,25 +171,21 @@ def make_json_safe(obj):
             )
             and missing
         ):
-
             return None
 
     except Exception:
-
         pass
 
     if isinstance(
         obj,
         pd.Timestamp,
     ):
-
         return obj.isoformat()
 
     if isinstance(
         obj,
         Path,
     ):
-
         return str(obj)
 
     if hasattr(
@@ -348,13 +194,10 @@ def make_json_safe(obj):
     ):
 
         try:
-
             return make_json_safe(
                 obj.__geo_interface__
             )
-
         except Exception:
-
             pass
 
     if hasattr(
@@ -363,47 +206,13 @@ def make_json_safe(obj):
     ):
 
         try:
-
             return make_json_safe(
                 obj.to_dict()
             )
-
         except Exception:
-
             pass
 
     return str(obj)
-
-
-# ============================================================
-# IMAGE VALIDATION
-# ============================================================
-
-def validate_image(filename):
-
-    suffix = Path(
-        filename or ""
-    ).suffix.lower()
-
-    allowed = {
-        ".jpg",
-        ".jpeg",
-        ".png",
-        ".tif",
-        ".tiff",
-    }
-
-    if suffix not in allowed:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Unsupported image format. "
-                "Use JPG, JPEG, PNG, TIF or TIFF."
-            ),
-        )
-
-    return suffix
 
 
 # ============================================================
@@ -435,7 +244,10 @@ def build_satellite_region(
 # ============================================================
 # EARTH ENGINE INITIALIZATION
 #
-# RENDER / SERVICE ACCOUNT AUTHENTICATION
+# Render uses:
+#
+# GEE_PROJECT
+# GEE_SERVICE_ACCOUNT_JSON
 # ============================================================
 
 def initialize_earth_engine():
@@ -459,17 +271,9 @@ def initialize_earth_engine():
 
     try:
 
-        # ----------------------------------------------------
-        # Read service-account JSON stored in Render
-        # ----------------------------------------------------
-
         credentials_info = json.loads(
             service_account_json
         )
-
-        # ----------------------------------------------------
-        # Create Google service-account credentials
-        # ----------------------------------------------------
 
         credentials = (
             service_account.Credentials.from_service_account_info(
@@ -481,18 +285,10 @@ def initialize_earth_engine():
             )
         )
 
-        # ----------------------------------------------------
-        # Initialize Earth Engine
-        # ----------------------------------------------------
-
         ee.Initialize(
             credentials=credentials,
             project=project,
         )
-
-        # ----------------------------------------------------
-        # Verify that Earth Engine is actually reachable
-        # ----------------------------------------------------
 
         ee.Number(1).getInfo()
 
@@ -541,6 +337,7 @@ def initialize_earth_engine():
             "Earth Engine authentication failed: "
             f"{type(exc).__name__}: {exc}"
         )
+
 
 # ============================================================
 # SENTINEL-2 CLOUD MASK
@@ -926,425 +723,6 @@ def get_sentinel2_rgb_image(
 
 
 # ============================================================
-# IMAGE ANALYSIS BACKGROUND JOB
-# ============================================================
-
-def run_image_analysis_job(
-    job_id,
-    temp_path,
-    filename,
-):
-
-    try:
-
-        # ----------------------------------------------------
-        # 5% - FILE READY
-        # ----------------------------------------------------
-
-        update_image_job(
-            job_id,
-            5,
-            "Image uploaded",
-            "Image uploaded and ready for analysis.",
-        )
-
-        # ----------------------------------------------------
-        # 10% - LOADING MODEL
-        # ----------------------------------------------------
-
-        update_image_job(
-            job_id,
-            10,
-            "Loading AI model",
-            "Loading the DeepForest tree detection model...",
-        )
-
-        model = (
-            get_deepforest_model()
-        )
-
-        # ----------------------------------------------------
-        # 15% - MODEL READY
-        # ----------------------------------------------------
-
-        update_image_job(
-            job_id,
-            15,
-            "AI model ready",
-            "DeepForest model loaded successfully.",
-        )
-
-        # ----------------------------------------------------
-        # 20% - TREE DETECTION START
-        # ----------------------------------------------------
-
-        update_image_job(
-            job_id,
-            20,
-            "Tree detection",
-            "Detecting individual trees with DeepForest...",
-        )
-
-        predictions = detect_trees(
-            model,
-            temp_path,
-            patch_size=400,
-            patch_overlap=0.25,
-            iou_threshold=0.15,
-        )
-
-        predictions = (
-            compute_crown_metrics(
-                predictions,
-                pixel_size_m=0.1,
-            )
-        )
-
-        tree_count = len(
-            predictions
-        )
-
-        # ----------------------------------------------------
-        # LOG DETECTED BOXES
-        # ----------------------------------------------------
-
-        print(
-            "\n========== DETECTED TREE BOXES =========="
-        )
-
-        box_columns = [
-            column
-            for column in [
-                "xmin",
-                "ymin",
-                "xmax",
-                "ymax",
-                "score",
-                "label",
-            ]
-            if column in predictions.columns
-        ]
-
-        if box_columns:
-
-            print(
-                predictions[
-                    box_columns
-                ].to_string(
-                    index=False
-                )
-            )
-
-        else:
-
-            print(
-                "Bounding-box columns were not found. "
-                f"Available columns: "
-                f"{list(predictions.columns)}"
-            )
-
-        print(
-            "=========================================\n"
-        )
-
-        # ----------------------------------------------------
-        # 50% - TREE DETECTION COMPLETE
-        # ----------------------------------------------------
-
-        update_image_job(
-            job_id,
-            50,
-            "Tree detection complete",
-            f"Detected {tree_count} trees.",
-        )
-
-        # ----------------------------------------------------
-        # 55% - CROWN SEGMENTATION START
-        # ----------------------------------------------------
-
-        update_image_job(
-            job_id,
-            55,
-            "Crown segmentation",
-            "Segmenting individual tree crowns...",
-        )
-
-        segmentation_output = (
-            segment_tree_crowns(
-                temp_path,
-                predictions,
-            )
-        )
-
-        # ----------------------------------------------------
-        # 70% - CROWN SEGMENTATION COMPLETE
-        # ----------------------------------------------------
-
-        update_image_job(
-            job_id,
-            70,
-            "Crown segmentation complete",
-            "Tree crown segmentation completed.",
-        )
-
-        # ----------------------------------------------------
-        # 75% - BIOMASS START
-        # ----------------------------------------------------
-
-        update_image_job(
-            job_id,
-            75,
-            "Biomass estimation",
-            "Calculating aboveground biomass...",
-        )
-
-        # ----------------------------------------------------
-        # EMPTY TREE RESULT
-        # ----------------------------------------------------
-
-        if predictions.empty:
-
-            biomass_result = {
-
-                "status":
-                    "success",
-
-                "tree_count":
-                    0,
-
-                "total_agb_tonnes":
-                    0.0,
-
-                "total_carbon_tonnes":
-                    0.0,
-
-                "total_co2e_tonnes":
-                    0.0,
-
-                "trees":
-                    [],
-            }
-
-        # ----------------------------------------------------
-        # BIOMASS CALCULATION
-        # ----------------------------------------------------
-
-        else:
-
-            df = (
-                per_tree_biomass_pipeline(
-                    predictions,
-                    wood_density_g_cm3=0.6,
-                    crown_diameter_column=(
-                        "crown_diameter_m"
-                    ),
-                )
-            )
-
-            trees = []
-
-            for i, row in df.iterrows():
-
-                trees.append(
-                    make_json_safe(
-                        {
-                            "tree_id":
-                                int(i) + 1,
-
-                            "crown_diameter_m":
-                                row.get(
-                                    "biomass_crown_diameter_m"
-                                ),
-
-                            "dbh_cm":
-                                row.get(
-                                    "dbh_cm"
-                                ),
-
-                            "height_m":
-                                row.get(
-                                    "height_m"
-                                ),
-
-                            "agb_kg":
-                                row.get(
-                                    "agb_kg"
-                                ),
-
-                            "agb_tonnes":
-                                row.get(
-                                    "agb_tonnes"
-                                ),
-
-                            "carbon_tonnes":
-                                row.get(
-                                    "carbon_tonnes"
-                                ),
-
-                            "co2e_tonnes":
-                                row.get(
-                                    "co2e_tonnes"
-                                ),
-                        }
-                    )
-                )
-
-            biomass_result = {
-
-                "status":
-                    "success",
-
-                "tree_count":
-                    len(df),
-
-                "method":
-                    (
-                        "Jucker crown-to-DBH + "
-                        "Feldpausch height + "
-                        "Chave 2014 AGB"
-                    ),
-
-                "wood_density_g_cm3":
-                    0.6,
-
-                "total_agb_tonnes":
-                    float(
-                        df[
-                            "agb_tonnes"
-                        ].sum()
-                    ),
-
-                "total_carbon_tonnes":
-                    float(
-                        df[
-                            "carbon_tonnes"
-                        ].sum()
-                    ),
-
-                "total_co2e_tonnes":
-                    float(
-                        df[
-                            "co2e_tonnes"
-                        ].sum()
-                    ),
-
-                "trees":
-                    trees,
-            }
-
-        # ----------------------------------------------------
-        # 90% - BIOMASS COMPLETE
-        # ----------------------------------------------------
-
-        update_image_job(
-            job_id,
-            90,
-            "Biomass estimation complete",
-            "Biomass and carbon calculations completed.",
-        )
-
-        # ----------------------------------------------------
-        # 95% - PREPARING RESPONSE
-        # ----------------------------------------------------
-
-        update_image_job(
-            job_id,
-            95,
-            "Preparing results",
-            "Preparing final analysis results...",
-        )
-
-        # ----------------------------------------------------
-        # FINAL RESPONSE
-        # ----------------------------------------------------
-
-        response = {
-
-            "status":
-                "success",
-
-            "analysis_id":
-                uuid.uuid4().hex,
-
-            "filename":
-                filename,
-
-            "tree_count":
-                tree_count,
-
-            "modules": {
-
-                "tree_detection": {
-
-                    "status":
-                        "success",
-
-                    "model":
-                        "weecology/deepforest-tree",
-
-                    "tree_count":
-                        tree_count,
-
-                    "trees":
-                        predictions.to_dict(
-                            orient="records"
-                        ),
-                },
-
-                "crown_segmentation":
-                    segmentation_output,
-
-                "biomass":
-                    biomass_result,
-            },
-        }
-
-        response = make_json_safe(
-            response
-        )
-
-        # ----------------------------------------------------
-        # 100% - COMPLETE
-        # ----------------------------------------------------
-
-        complete_image_job(
-            job_id,
-            response,
-        )
-
-    except Exception as exc:
-
-        traceback.print_exc()
-
-        fail_image_job(
-            job_id,
-            (
-                f"Image analysis failed: "
-                f"{type(exc).__name__}: {exc}"
-            ),
-        )
-
-    finally:
-
-        if (
-            temp_path
-            and os.path.exists(
-                temp_path
-            )
-        ):
-
-            try:
-
-                os.remove(
-                    temp_path
-                )
-
-            except Exception:
-
-                pass
-
-
-# ============================================================
 # ROOT
 # ============================================================
 
@@ -1352,8 +730,9 @@ def run_image_analysis_job(
 def root():
 
     return {
+
         "service":
-            "SYLVASENSE backend",
+            "SYLVASENSE Earth Engine backend",
 
         "status":
             "online",
@@ -1379,18 +758,9 @@ def status():
             "healthy",
 
         "service":
-            "SYLVASENSE backend",
-
-        "deepforest_model":
-            "weecology/deepforest-tree",
+            "SYLVASENSE Earth Engine backend",
 
         "modules": [
-
-            "tree_detection",
-
-            "crown_segmentation",
-
-            "biomass",
 
             "sentinel_1",
 
@@ -1407,9 +777,10 @@ def status():
             "satellite_agb",
 
             "satellite_rgb_acquisition",
-
-            "image_analysis_progress",
         ],
+
+        "image_analysis_backend":
+            "separate_service",
     }
 
 
@@ -1424,202 +795,6 @@ def health():
         "status":
             "ok"
     }
-
-
-# ============================================================
-# IMAGE ANALYSIS
-#
-# START JOB
-# ============================================================
-
-@app.post(
-    "/api/image-analyze"
-)
-async def image_analyze(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-):
-
-    suffix = validate_image(
-        file.filename
-    )
-
-    data = await file.read()
-
-    if not data:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded file is empty.",
-        )
-
-    if len(data) > 25 * 1024 * 1024:
-
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                "Image file is too large. "
-                "Maximum size is 25 MB."
-            ),
-        )
-
-    temp_path = None
-
-    try:
-
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=suffix,
-        ) as temp:
-
-            temp.write(
-                data
-            )
-
-            temp_path = temp.name
-
-        # ----------------------------------------------------
-        # CREATE JOB
-        # ----------------------------------------------------
-
-        job_id = create_image_job(
-            file.filename
-        )
-
-        # ----------------------------------------------------
-        # START BACKGROUND ANALYSIS
-        # ----------------------------------------------------
-
-        background_tasks.add_task(
-            run_image_analysis_job,
-            job_id,
-            temp_path,
-            file.filename,
-        )
-
-        # ----------------------------------------------------
-        # RETURN IMMEDIATELY
-        # ----------------------------------------------------
-
-        return {
-
-            "status":
-                "accepted",
-
-            "job_id":
-                job_id,
-
-            "filename":
-                file.filename,
-
-            "progress":
-                0,
-
-            "stage":
-                "Queued",
-
-            "message":
-                "Image analysis started.",
-        }
-
-    except Exception as exc:
-
-        if (
-            temp_path
-            and os.path.exists(
-                temp_path
-            )
-        ):
-
-            try:
-
-                os.remove(
-                    temp_path
-                )
-
-            except Exception:
-
-                pass
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"Unable to start image analysis: "
-                f"{type(exc).__name__}: {exc}"
-            ),
-        )
-
-
-# ============================================================
-# IMAGE ANALYSIS PROGRESS
-# ============================================================
-
-@app.get(
-    "/api/image-analysis-progress/{job_id}"
-)
-def image_analysis_progress(
-    job_id: str,
-):
-
-    with _image_jobs_lock:
-
-        job = _image_jobs.get(
-            job_id
-        )
-
-        if job is None:
-
-            raise HTTPException(
-                status_code=404,
-                detail="Analysis job not found.",
-            )
-
-        return {
-
-            "job_id":
-                job["job_id"],
-
-            "filename":
-                job["filename"],
-
-            "status":
-                job["status"],
-
-            "progress":
-                job["progress"],
-
-            "stage":
-                job["stage"],
-
-            "message":
-                job["message"],
-
-            "result":
-                job["result"],
-
-            "error":
-                job["error"],
-        }
-
-
-# ============================================================
-# TREE DETECTION
-#
-# Kept as an alias for compatibility.
-# ============================================================
-
-@app.post(
-    "/api/tree-detection"
-)
-async def tree_detection(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-):
-
-    return await image_analyze(
-        background_tasks,
-        file,
-    )
 
 
 # ============================================================
@@ -1645,12 +820,14 @@ class ForecastRequest(BaseModel):
 
 
 # ============================================================
-# OLD AGB FORECAST ENDPOINT
+# AGB FORECAST
+#
+# IMPORTANT:
+# This remains on Render.
+# It uses agb_forecasting.py.
 # ============================================================
 
-@app.post(
-    "/api/forecast"
-)
+@app.post("/api/forecast")
 def forecast(
     req: ForecastRequest,
 ):
@@ -1682,6 +859,7 @@ def forecast(
 
         return make_json_safe(
             {
+
                 "status":
                     "success",
 
@@ -1749,9 +927,7 @@ class SatelliteAnalysisRequest(BaseModel):
 # SATELLITE ANALYSIS
 # ============================================================
 
-@app.post(
-    "/api/satellite-analysis"
-)
+@app.post("/api/satellite-analysis")
 def satellite_analysis(
     req: SatelliteAnalysisRequest,
 ):
@@ -1829,19 +1005,15 @@ def satellite_analysis(
                 name.startswith("SAR")
                 and not req.include_sar
             ):
-
                 continue
 
             if name == "NDVI":
-
                 image = ndvi
 
             elif name.startswith("SAR"):
-
                 image = sar
 
             else:
-
                 image = optical
 
             map_id = image.getMapId(
@@ -1860,22 +1032,10 @@ def satellite_analysis(
                     (
                         name
                         .lower()
-                        .replace(
-                            " ",
-                            "_",
-                        )
-                        .replace(
-                            "(",
-                            "",
-                        )
-                        .replace(
-                            ")",
-                            "",
-                        )
-                        .replace(
-                            "/",
-                            "_",
-                        )
+                        .replace(" ", "_")
+                        .replace("(", "")
+                        .replace(")", "")
+                        .replace("/", "_")
                     ),
 
                 "name":
@@ -1902,19 +1062,13 @@ def satellite_analysis(
                     ),
 
                 "min":
-                    params.get(
-                        "min"
-                    ),
+                    params.get("min"),
 
                 "max":
-                    params.get(
-                        "max"
-                    ),
+                    params.get("max"),
 
                 "palette":
-                    params.get(
-                        "palette"
-                    ),
+                    params.get("palette"),
 
                 "default_visible":
                     name in {
@@ -1923,13 +1077,11 @@ def satellite_analysis(
                     },
             }
 
-            layers.append(
-                layer
-            )
+            layers.append(layer)
 
-        # ----------------------------------------------------
+        # ====================================================
         # GEDI RH98
-        # ----------------------------------------------------
+        # ====================================================
 
         gedi_image, gedi_count = (
             get_gedi_rh98(
@@ -1998,9 +1150,7 @@ def satellite_analysis(
                     40,
 
                 "palette":
-                    gedi_vis[
-                        "palette"
-                    ],
+                    gedi_vis["palette"],
 
                 "default_visible":
                     False,
@@ -2191,7 +1341,6 @@ def satellite_analysis(
         )
 
     except HTTPException:
-
         raise
 
     except Exception as exc:
@@ -2252,9 +1401,7 @@ class ChangeDetectionRequest(BaseModel):
 # CHANGE DETECTION
 # ============================================================
 
-@app.post(
-    "/api/change-detection"
-)
+@app.post("/api/change-detection")
 def change_detection(
     req: ChangeDetectionRequest,
 ):
@@ -2511,7 +1658,6 @@ def change_detection(
         )
 
         if decrease_pixels is None:
-
             decrease_pixels = 0
 
         increase_result = (
@@ -2534,7 +1680,6 @@ def change_detection(
         )
 
         if increase_pixels is None:
-
             increase_pixels = 0
 
         ndvi_vis = {
@@ -2835,7 +1980,6 @@ def change_detection(
         )
 
     except HTTPException:
-
         raise
 
     except Exception as exc:
@@ -3129,7 +2273,6 @@ def get_yearly_gedi_agbd(
     )
 
     if valid_pixel_count is None:
-
         valid_pixel_count = 0
 
     try:
@@ -3373,7 +2516,6 @@ def find_gedi_year_result(
         )
 
         if radius < 100:
-
             radius = 100.0
 
         duplicate = any(
@@ -3382,8 +2524,7 @@ def find_gedi_year_result(
                 -
                 radius
             ) < 1
-            for existing
-            in search_radii
+            for existing in search_radii
         )
 
         if not duplicate:
@@ -3536,26 +2677,16 @@ def get_yearly_sentinel_rgb(
 # SATELLITE AGB ANALYSIS
 # ============================================================
 
-@app.post(
-    "/api/satellite-agb"
-)
+@app.post("/api/satellite-agb")
 def satellite_agb_analysis(
     req: SatelliteAGBRequest,
 ):
 
     try:
 
-        # ----------------------------------------------------
-        # EARTH ENGINE
-        # ----------------------------------------------------
-
         gee_project = (
             initialize_earth_engine()
         )
-
-        # ----------------------------------------------------
-        # ORIGINAL USER REGION
-        # ----------------------------------------------------
 
         requested_region = (
             build_satellite_region(
@@ -3564,10 +2695,6 @@ def satellite_agb_analysis(
                 radius_m=req.radius_m,
             )
         )
-
-        # ----------------------------------------------------
-        # HISTORICAL GEDI SEARCH
-        # ----------------------------------------------------
 
         historical = []
 
@@ -4228,7 +3355,6 @@ def satellite_agb_analysis(
         )
 
     except HTTPException:
-
         raise
 
     except Exception as exc:
