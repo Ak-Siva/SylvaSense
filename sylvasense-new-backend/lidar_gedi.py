@@ -1,366 +1,604 @@
+# ============================================================
+# SYLVASENSE - GEDI L4A ABOVEGROUND BIOMASS DENSITY
+# ============================================================
+
 import ee
-import folium
 
 
 # ============================================================
-# GEDI CONFIGURATION
+# CONFIGURATION
 # ============================================================
 
-GEDI_COLLECTION = "LARSE/GEDI/GEDI02_A_002_MONTHLY"
+GEDI_COLLECTION = (
+    "LARSE/GEDI/GEDI04_A_002_MONTHLY"
+)
 
 GEDI_START = "2019-03-25"
-GEDI_END_EXCLUSIVE = "2024-12-01"
+
+# Current Earth Engine catalog availability extends into 2025.
+GEDI_END_EXCLUSIVE = "2025-08-01"
 
 GEDI_LAT_MIN = -51.6
 GEDI_LAT_MAX = 51.6
 
 
 # ============================================================
-# DATE VALIDATION
+# VALIDATION
 # ============================================================
 
-def validate_gedi_window(start_date, end_date):
-    """
-    Validate that the requested GEDI period is inside
-    the available GEDI mission/data window.
-    """
-
+def validate_gedi_window(
+    start_date,
+    end_date,
+):
     start_date = str(start_date)
     end_date = str(end_date)
 
     if start_date < GEDI_START:
         raise ValueError(
-            f"GEDI analysis cannot start before {GEDI_START}."
-        )
-
-    if end_date >= GEDI_END_EXCLUSIVE:
-        raise ValueError(
-            "GEDI analysis end date must be before "
-            "2024-12-01 (project window ends in November 2024)."
+            f"GEDI analysis cannot start before "
+            f"{GEDI_START}."
         )
 
     if start_date >= end_date:
         raise ValueError(
-            "GEDI start date must be earlier than the end date."
+            "GEDI start date must be before "
+            "GEDI end date."
         )
 
 
-# ============================================================
-# REGION VALIDATION
-# ============================================================
-
-def validate_gedi_region(region):
-    """
-    Check whether the selected region falls within
-    the GEDI latitude coverage.
-    """
-
-    coords = (
+def validate_gedi_region(
+    region,
+):
+    coordinates = (
         region
         .bounds()
         .coordinates()
-        .getInfo()[0]
+        .getInfo()
     )
 
-    if not coords:
+    if not coordinates:
         raise ValueError(
-            "Unable to determine the selected GEDI region."
+            "Unable to determine GEDI analysis region."
         )
 
-    lats = [
+    outer_ring = coordinates[0]
+
+    if not outer_ring:
+        raise ValueError(
+            "GEDI analysis region is empty."
+        )
+
+    latitudes = [
         point[1]
-        for point in coords
+        for point in outer_ring
     ]
 
+    if not latitudes:
+        raise ValueError(
+            "GEDI region contains no latitude coordinates."
+        )
+
     if (
-        max(lats) < GEDI_LAT_MIN
-        or min(lats) > GEDI_LAT_MAX
+        max(latitudes) < GEDI_LAT_MIN
+        or min(latitudes) > GEDI_LAT_MAX
     ):
         raise ValueError(
-            "The selected region is outside GEDI coverage."
+            "The selected region is outside "
+            "GEDI coverage."
         )
 
 
 # ============================================================
-# BUILD QUALITY-FILTERED GEDI COLLECTION
+# DATE HELPER
 # ============================================================
 
-def _get_quality_filtered_collection(
-    region,
-    start_date=GEDI_START,
-    end_date="2024-11-30",
+def make_exclusive_end_date(
+    end_date,
 ):
     """
-    Build the quality-filtered GEDI RH98 collection.
+    Convert an inclusive-looking YYYY-MM-DD date into
+    an exclusive Earth Engine end date.
 
-    Important:
-    filterDate uses the user's actual end date rather than
-    always forcing 2024-12-01.
+    Example:
+        2024-11-30
+        ->
+        2024-12-01
     """
 
+    return (
+        ee.Date(
+            str(end_date)
+        )
+        .advance(
+            1,
+            "day",
+        )
+    )
+
+
+# ============================================================
+# QUALITY FILTER
+# ============================================================
+
+def apply_gedi_quality_mask(
+    image,
+):
+    """
+    Official GEDI L4A quality filtering:
+
+        l4_quality_flag == 1
+        degrade_flag == 0
+
+    The Earth Engine catalog identifies:
+      agbd -> aboveground biomass density
+      l4_quality_flag -> useful biomass predictions
+      degrade_flag -> degraded positioning/pointing flag
+    """
+
+    quality = (
+        image
+        .select(
+            "l4_quality_flag"
+        )
+        .eq(1)
+    )
+
+    not_degraded = (
+        image
+        .select(
+            "degrade_flag"
+        )
+        .eq(0)
+    )
+
+    return (
+        image
+        .updateMask(
+            quality
+        )
+        .updateMask(
+            not_degraded
+        )
+    )
+
+
+# ============================================================
+# GET GEDI L4A COLLECTION
+# ============================================================
+
+def get_gedi_collection(
+    region,
+    start_date=GEDI_START,
+    end_date="2025-07-31",
+):
     validate_gedi_window(
         start_date,
         end_date,
     )
 
-    validate_gedi_region(region)
+    validate_gedi_region(
+        region
+    )
 
-    # Earth Engine filterDate has an exclusive end date.
-    # Therefore convert the requested end date to the
-    # following day when necessary.
-    end_date_exclusive = ee.Date(
-        str(end_date)
-    ).advance(
-        1,
-        "day",
+    exclusive_end = (
+        make_exclusive_end_date(
+            end_date
+        )
     )
 
     collection = (
         ee.ImageCollection(
             GEDI_COLLECTION
         )
-        .filterBounds(region)
+        .filterBounds(
+            region
+        )
         .filterDate(
             str(start_date),
-            end_date_exclusive,
+            exclusive_end,
         )
         .map(
-            lambda image:
-                image
-                .updateMask(
-                    image
-                    .select("quality_flag")
-                    .eq(1)
-                )
-                .updateMask(
-                    image
-                    .select("degrade_flag")
-                    .eq(0)
-                )
+            apply_gedi_quality_mask
         )
-        .select("rh98")
+        .select(
+            "agbd"
+        )
     )
 
     return collection
 
 
 # ============================================================
-# GET GEDI RH98
+# GEDI AGBD STATISTICS
+# ============================================================
+
+def gedi_agbd_statistics(
+    region,
+    start_date=GEDI_START,
+    end_date="2025-07-31",
+):
+    """
+    Return GEDI L4A AGBD statistics for a region.
+
+    Units:
+        Mg/ha
+
+    Returns an unavailable result rather than raising when
+    there are no valid GEDI pixels.
+    """
+
+    try:
+
+        collection = get_gedi_collection(
+            region=region,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+        image_count = int(
+            collection
+            .size()
+            .getInfo()
+            or 0
+        )
+
+        if image_count == 0:
+
+            return {
+                "available": False,
+                "collection_images": 0,
+                "valid_pixels": 0,
+                "agbd_mean_mg_ha": None,
+                "agbd_median_mg_ha": None,
+                "agbd_min_mg_ha": None,
+                "agbd_max_mg_ha": None,
+                "reason": (
+                    "No GEDI L4A monthly scenes "
+                    "intersected the requested region "
+                    "during this period."
+                ),
+            }
+
+        # Median is preferable here to avoid one monthly
+        # observation dominating the regional result.
+        image = (
+            collection
+            .median()
+            .clip(
+                region
+            )
+        )
+
+        count_result = (
+            image
+            .reduceRegion(
+                reducer=ee.Reducer.count(),
+                geometry=region,
+                scale=25,
+                maxPixels=1_000_000_000,
+                bestEffort=True,
+            )
+            .getInfo()
+            or {}
+        )
+
+        valid_pixels = (
+            count_result.get(
+                "agbd"
+            )
+            or 0
+        )
+
+        try:
+            valid_pixels = int(
+                valid_pixels
+            )
+        except Exception:
+            valid_pixels = 0
+
+        if valid_pixels <= 0:
+
+            return {
+                "available": False,
+                "collection_images": image_count,
+                "valid_pixels": 0,
+                "agbd_mean_mg_ha": None,
+                "agbd_median_mg_ha": None,
+                "agbd_min_mg_ha": None,
+                "agbd_max_mg_ha": None,
+                "reason": (
+                    "GEDI scenes exist, but there are "
+                    "no valid quality-filtered GEDI "
+                    "AGBD pixels in this region."
+                ),
+            }
+
+        stats = (
+            image
+            .reduceRegion(
+                reducer=(
+                    ee.Reducer.mean()
+                    .combine(
+                        reducer2=ee.Reducer.median(),
+                        sharedInputs=True,
+                    )
+                    .combine(
+                        reducer2=ee.Reducer.minMax(),
+                        sharedInputs=True,
+                    )
+                ),
+                geometry=region,
+                scale=25,
+                maxPixels=1_000_000_000,
+                bestEffort=True,
+            )
+            .getInfo()
+            or {}
+        )
+
+        def to_float(
+            value,
+        ):
+            try:
+                if value is None:
+                    return None
+
+                return float(
+                    value
+                )
+
+            except Exception:
+                return None
+
+        mean_value = to_float(
+            stats.get(
+                "agbd_mean"
+            )
+        )
+
+        median_value = to_float(
+            stats.get(
+                "agbd_median"
+            )
+        )
+
+        min_value = to_float(
+            stats.get(
+                "agbd_min"
+            )
+        )
+
+        max_value = to_float(
+            stats.get(
+                "agbd_max"
+            )
+        )
+
+        if mean_value is None:
+
+            return {
+                "available": False,
+                "collection_images": image_count,
+                "valid_pixels": valid_pixels,
+                "agbd_mean_mg_ha": None,
+                "agbd_median_mg_ha": median_value,
+                "agbd_min_mg_ha": min_value,
+                "agbd_max_mg_ha": max_value,
+                "reason": (
+                    "Earth Engine returned valid GEDI "
+                    "pixels but no numeric AGBD mean."
+                ),
+            }
+
+        return {
+            "available": True,
+
+            "collection_images":
+                image_count,
+
+            "valid_pixels":
+                valid_pixels,
+
+            "agbd_mean_mg_ha":
+                mean_value,
+
+            "agbd_median_mg_ha":
+                median_value,
+
+            "agbd_min_mg_ha":
+                min_value,
+
+            "agbd_max_mg_ha":
+                max_value,
+
+            "reason":
+                (
+                    "Valid GEDI L4A AGBD observations "
+                    "were found."
+                ),
+        }
+
+    except Exception as exc:
+
+        return {
+            "available": False,
+            "collection_images": 0,
+            "valid_pixels": 0,
+            "agbd_mean_mg_ha": None,
+            "agbd_median_mg_ha": None,
+            "agbd_min_mg_ha": None,
+            "agbd_max_mg_ha": None,
+            "reason": (
+                f"GEDI query failed: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        }
+
+
+# ============================================================
+# GET GEDI AGBD IMAGE
+# ============================================================
+
+def get_gedi_agbd_image(
+    region,
+    start_date=GEDI_START,
+    end_date="2025-07-31",
+):
+    """
+    Return:
+        image
+        statistics
+    """
+
+    statistics = (
+        gedi_agbd_statistics(
+            region=region,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    )
+
+    if not statistics.get(
+        "available"
+    ):
+        return (
+            None,
+            statistics,
+        )
+
+    collection = get_gedi_collection(
+        region=region,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+    image = (
+        collection
+        .median()
+        .clip(
+            region
+        )
+    )
+
+    return (
+        image,
+        statistics,
+    )
+
+
+# ============================================================
+# GEDI MAP LAYER
+# ============================================================
+
+def get_gedi_agbd_tile(
+    region,
+    start_date=GEDI_START,
+    end_date="2025-07-31",
+):
+    """
+    Return a tile URL when GEDI is available.
+
+    Otherwise return tile_url=None.
+    """
+
+    image, statistics = (
+        get_gedi_agbd_image(
+            region=region,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    )
+
+    if image is None:
+
+        return {
+            "available": False,
+            "tile_url": None,
+            "statistics": statistics,
+        }
+
+    visualization = {
+        "min": 0,
+        "max": 400,
+        "palette": [
+            "440154",
+            "31688e",
+            "35b779",
+            "fde725",
+        ],
+    }
+
+    map_id = image.getMapId(
+        visualization
+    )
+
+    tile_url = (
+        map_id[
+            "tile_fetcher"
+        ].url_format
+    )
+
+    return {
+        "available": True,
+        "tile_url": tile_url,
+        "statistics": statistics,
+        "visualization": visualization,
+    }
+
+
+# ============================================================
+# BACKWARD-COMPATIBILITY ALIAS
 # ============================================================
 
 def get_gedi_rh98(
     region,
     start_date=GEDI_START,
-    end_date="2024-11-30",
+    end_date="2025-07-31",
 ):
     """
-    Return a quality-filtered median GEDI RH98 image.
+    Kept only so old imports do not immediately crash.
 
-    This function checks BOTH:
-
-    1. Whether GEDI images exist.
-    2. Whether valid GEDI pixels actually exist inside
-       the selected region.
-
-    This prevents a false 'GEDI available' result when all
-    pixels are masked by quality/degrade flags.
+    IMPORTANT:
+    This now returns GEDI L4A AGBD, not RH98.
     """
 
-    collection = _get_quality_filtered_collection(
-        region,
-        start_date,
-        end_date,
+    image, statistics = (
+        get_gedi_agbd_image(
+            region=region,
+            start_date=start_date,
+            end_date=end_date,
+        )
     )
 
-    # --------------------------------------------------------
-    # Check number of GEDI images
-    # --------------------------------------------------------
+    if image is None:
 
-    image_count = (
-        collection
-        .size()
-        .getInfo()
-    )
-
-    if not image_count:
         raise ValueError(
-            "No GEDI images were found for this region "
-            "and date range."
+            statistics.get(
+                "reason",
+                "No valid GEDI AGBD data found.",
+            )
         )
 
-    # --------------------------------------------------------
-    # Create median RH98 image
-    # --------------------------------------------------------
-
-    image = (
-        collection
-        .median()
-        .clip(region)
+    return (
+        image,
+        statistics.get(
+            "collection_images",
+            0,
+        ),
     )
 
-    # --------------------------------------------------------
-    # IMPORTANT:
-    # Check actual valid pixels.
-    #
-    # collection.size() can be > 0 while the selected
-    # location has zero valid GEDI observations.
-    # --------------------------------------------------------
-
-    valid_pixel_result = (
-        image
-        .reduceRegion(
-            reducer=ee.Reducer.count(),
-            geometry=region,
-            scale=25,
-            maxPixels=1e9,
-            bestEffort=True,
-        )
-        .getInfo()
-    )
-
-    valid_pixel_count = (
-        valid_pixel_result.get("rh98", 0)
-        if valid_pixel_result
-        else 0
-    )
-
-    if not valid_pixel_count:
-        raise ValueError(
-            "GEDI images were found, but there are no valid "
-            "quality-filtered GEDI RH98 pixels at the selected "
-            "location."
-        )
-
-    return image, image_count
-
-
-# ============================================================
-# GEDI STATISTICS
-# ============================================================
 
 def gedi_statistics(
     region,
     start_date=GEDI_START,
-    end_date="2024-11-30",
+    end_date="2025-07-31",
 ):
     """
-    Calculate GEDI RH98 statistics for the selected region.
+    Backward-compatible function.
     """
 
-    image, image_count = get_gedi_rh98(
-        region,
-        start_date,
-        end_date,
+    return gedi_agbd_statistics(
+        region=region,
+        start_date=start_date,
+        end_date=end_date,
     )
-
-    stats = (
-        image
-        .reduceRegion(
-            reducer=(
-                ee.Reducer.mean()
-                .combine(
-                    ee.Reducer.minMax(),
-                    sharedInputs=True,
-                )
-                .combine(
-                    ee.Reducer.count(),
-                    sharedInputs=True,
-                )
-            ),
-            geometry=region,
-            scale=25,
-            maxPixels=1e9,
-            bestEffort=True,
-        )
-        .getInfo()
-    )
-
-    if not stats:
-        raise ValueError(
-            "GEDI statistics could not be calculated "
-            "for the selected region."
-        )
-
-    valid_pixels = stats.get(
-        "rh98_count"
-    )
-
-    if not valid_pixels:
-        raise ValueError(
-            "No valid GEDI RH98 pixels were available "
-            "for the selected location."
-        )
-
-    return {
-        "available": True,
-        "collection_images": image_count,
-        "rh98_mean_m": stats.get(
-            "rh98_mean"
-        ),
-        "rh98_min_m": stats.get(
-            "rh98_min"
-        ),
-        "rh98_max_m": stats.get(
-            "rh98_max"
-        ),
-        "rh98_valid_pixels": valid_pixels,
-    }
-
-
-# ============================================================
-# ADD GEDI MAP LAYER
-# ============================================================
-
-def add_gedi_layer(
-    map_object,
-    region,
-    start_date=GEDI_START,
-    end_date="2024-11-30",
-    show=False,
-):
-    """
-    Add GEDI RH98 visualization to a Folium map.
-    """
-
-    image, image_count = get_gedi_rh98(
-        region,
-        start_date,
-        end_date,
-    )
-
-    map_id = image.getMapId(
-        {
-            "min": 0,
-            "max": 40,
-            "palette": [
-                "440154",
-                "31688e",
-                "35b779",
-                "fde725",
-            ],
-        }
-    )
-
-    folium.raster_layers.TileLayer(
-        tiles=(
-            map_id[
-                "tile_fetcher"
-            ].url_format
-        ),
-        attr=(
-            "NASA GEDI / "
-            "Google Earth Engine"
-        ),
-        name="GEDI RH98 (m)",
-        overlay=True,
-        control=True,
-        show=show,
-        opacity=0.75,
-    ).add_to(
-        map_object
-    )
-
-    return {
-        "available": True,
-        "collection_images": image_count,
-    }
