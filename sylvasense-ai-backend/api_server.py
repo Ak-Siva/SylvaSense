@@ -22,6 +22,8 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("TORCH_NUM_THREADS", "1")
 
 
 # ============================================================
@@ -29,7 +31,6 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 # ============================================================
 
 from pathlib import Path
-from functools import lru_cache
 
 from fastapi import (
     FastAPI,
@@ -49,6 +50,13 @@ import threading
 import numpy as np
 import pandas as pd
 
+
+# ============================================================
+# LOCAL MODULES
+#
+# tree_detection itself uses lazy imports for DeepForest,
+# PyTorch Lightning and matplotlib.
+# ============================================================
 
 from tree_detection import (
     load_model,
@@ -95,21 +103,119 @@ app.add_middleware(
 
 # ============================================================
 # DEEPFOREST MODEL
+#
+# IMPORTANT:
+#
+# Do NOT use functools.lru_cache here.
+#
+# A normal singleton protected by a lock makes model
+# initialization explicit and prevents duplicate initialization
+# if two requests arrive close together.
 # ============================================================
 
-@lru_cache(maxsize=1)
+_deepforest_model = None
+_model_lock = threading.Lock()
+
+
 def get_deepforest_model():
+    """
+    Return the single shared DeepForest model.
 
-    print("=" * 60)
-    print("Loading DeepForest model...")
-    print("=" * 60)
+    The model is loaded only once per backend process.
+    """
 
-    model = load_model()
+    global _deepforest_model
 
-    print("DeepForest model loaded successfully.")
-    print("=" * 60)
+    # --------------------------------------------------------
+    # Fast path:
+    # Model has already been loaded.
+    # --------------------------------------------------------
 
-    return model
+    if _deepforest_model is not None:
+
+        print(
+            "DeepForest model already loaded. "
+            "Using existing model."
+        )
+
+        return _deepforest_model
+
+    # --------------------------------------------------------
+    # Slow path:
+    # Only one thread is allowed to initialize the model.
+    # --------------------------------------------------------
+
+    with _model_lock:
+
+        # ----------------------------------------------------
+        # Double-check after acquiring the lock.
+        # Another thread may have initialized the model while
+        # this thread was waiting.
+        # ----------------------------------------------------
+
+        if _deepforest_model is not None:
+
+            print(
+                "DeepForest model initialized by another "
+                "thread. Using existing model."
+            )
+
+            return _deepforest_model
+
+        print("=" * 60)
+        print("DEEPFOREST MODEL INITIALIZATION")
+        print("=" * 60)
+
+        try:
+
+            print(
+                "Calling tree_detection.load_model()..."
+            )
+
+            model = load_model()
+
+            if model is None:
+
+                raise RuntimeError(
+                    "tree_detection.load_model() "
+                    "returned None."
+                )
+
+            _deepforest_model = model
+
+            print(
+                "DeepForest model loaded successfully."
+            )
+
+            print(
+                "DeepForest model is now cached "
+                "for this process."
+            )
+
+            print("=" * 60)
+
+            return _deepforest_model
+
+        except Exception as exc:
+
+            print("=" * 60)
+            print(
+                "DEEPFOREST MODEL INITIALIZATION FAILED"
+            )
+            print(
+                f"Error type: {type(exc).__name__}"
+            )
+            print(
+                f"Error: {exc}"
+            )
+            print("=" * 60)
+
+            traceback.print_exc()
+
+            # Do not leave a partially initialized model.
+            _deepforest_model = None
+
+            raise
 
 
 # ============================================================
@@ -117,23 +223,40 @@ def get_deepforest_model():
 # ============================================================
 
 _image_jobs = {}
+
 _image_jobs_lock = threading.Lock()
 
 
 def create_image_job():
 
-    job_id = str(uuid.uuid4())
+    job_id = str(
+        uuid.uuid4()
+    )
 
     with _image_jobs_lock:
 
         _image_jobs[job_id] = {
-            "job_id": job_id,
-            "status": "queued",
-            "progress": 0,
-            "stage": "Queued",
-            "message": "Image analysis queued.",
-            "result": None,
-            "error": None,
+
+            "job_id":
+                job_id,
+
+            "status":
+                "queued",
+
+            "progress":
+                0,
+
+            "stage":
+                "Queued",
+
+            "message":
+                "Image analysis queued.",
+
+            "result":
+                None,
+
+            "error":
+                None,
         }
 
     return job_id
@@ -149,7 +272,9 @@ def update_image_job(
 
     with _image_jobs_lock:
 
-        job = _image_jobs.get(job_id)
+        job = _image_jobs.get(
+            job_id
+        )
 
         if job is None:
             return
@@ -183,18 +308,25 @@ def complete_image_job(
 
     with _image_jobs_lock:
 
-        job = _image_jobs.get(job_id)
+        job = _image_jobs.get(
+            job_id
+        )
 
         if job is None:
             return
 
         job["status"] = "completed"
+
         job["progress"] = 100
+
         job["stage"] = "Completed"
+
         job["message"] = (
             "Image analysis completed successfully."
         )
+
         job["result"] = result
+
         job["error"] = None
 
 
@@ -205,49 +337,66 @@ def fail_image_job(
 
     with _image_jobs_lock:
 
-        job = _image_jobs.get(job_id)
+        job = _image_jobs.get(
+            job_id
+        )
 
         if job is None:
             return
 
         job["status"] = "failed"
+
         job["stage"] = "Failed"
-        job["message"] = "Image analysis failed."
-        job["error"] = str(error)
+
+        job["message"] = (
+            "Image analysis failed."
+        )
+
+        job["error"] = str(
+            error
+        )
 
 
 # ============================================================
 # JSON SERIALIZATION
-#
-# IMPORTANT:
-# DataFrames must remain DataFrames during AI processing.
-# This function is ONLY used when returning final results.
 # ============================================================
 
 def make_json_safe(obj):
 
-    if isinstance(obj, dict):
+    if isinstance(
+        obj,
+        dict,
+    ):
 
         return {
             str(key): make_json_safe(value)
             for key, value in obj.items()
         }
 
-    if isinstance(obj, list):
+    if isinstance(
+        obj,
+        list,
+    ):
 
         return [
             make_json_safe(value)
             for value in obj
         ]
 
-    if isinstance(obj, tuple):
+    if isinstance(
+        obj,
+        tuple,
+    ):
 
         return [
             make_json_safe(value)
             for value in obj
         ]
 
-    if isinstance(obj, pd.DataFrame):
+    if isinstance(
+        obj,
+        pd.DataFrame,
+    ):
 
         return make_json_safe(
             obj.to_dict(
@@ -255,23 +404,35 @@ def make_json_safe(obj):
             )
         )
 
-    if isinstance(obj, pd.Series):
+    if isinstance(
+        obj,
+        pd.Series,
+    ):
 
         return make_json_safe(
             obj.to_dict()
         )
 
-    if isinstance(obj, np.ndarray):
+    if isinstance(
+        obj,
+        np.ndarray,
+    ):
 
         return make_json_safe(
             obj.tolist()
         )
 
-    if isinstance(obj, np.integer):
+    if isinstance(
+        obj,
+        np.integer,
+    ):
 
         return int(obj)
 
-    if isinstance(obj, np.floating):
+    if isinstance(
+        obj,
+        np.floating,
+    ):
 
         value = float(obj)
 
@@ -280,11 +441,17 @@ def make_json_safe(obj):
 
         return value
 
-    if isinstance(obj, np.bool_):
+    if isinstance(
+        obj,
+        np.bool_,
+    ):
 
         return bool(obj)
 
-    if isinstance(obj, float):
+    if isinstance(
+        obj,
+        float,
+    ):
 
         if not np.isfinite(obj):
             return None
@@ -305,16 +472,24 @@ def make_json_safe(obj):
 
         return obj
 
-    if isinstance(obj, Path):
+    if isinstance(
+        obj,
+        Path,
+    ):
 
         return str(obj)
 
     try:
 
-        missing = pd.isna(obj)
+        missing = pd.isna(
+            obj
+        )
 
         if (
-            isinstance(missing, bool)
+            isinstance(
+                missing,
+                bool,
+            )
             and missing
         ):
 
@@ -323,7 +498,10 @@ def make_json_safe(obj):
     except Exception:
         pass
 
-    if hasattr(obj, "to_dict"):
+    if hasattr(
+        obj,
+        "to_dict",
+    ):
 
         try:
 
@@ -357,7 +535,9 @@ def validate_image(filename):
 
         raise HTTPException(
             status_code=400,
-            detail="No image filename provided.",
+            detail=(
+                "No image filename provided."
+            ),
         )
 
     extension = (
@@ -380,25 +560,15 @@ def validate_image(filename):
 
 # ============================================================
 # NORMALIZE DEEPFOREST DETECTION OUTPUT
-#
-# DeepForest versions/environments can return DataFrame-like
-# objects. The rest of SylvaSense expects pandas DataFrames.
-# Normalize here instead of failing with AssertionError.
 # ============================================================
 
-def normalize_detection_result(detections):
-
-    # --------------------------------------------------------
-    # No detections
-    # --------------------------------------------------------
+def normalize_detection_result(
+    detections,
+):
 
     if detections is None:
 
         return pd.DataFrame()
-
-    # --------------------------------------------------------
-    # Already a DataFrame
-    # --------------------------------------------------------
 
     if isinstance(
         detections,
@@ -406,10 +576,6 @@ def normalize_detection_result(detections):
     ):
 
         return detections.copy()
-
-    # --------------------------------------------------------
-    # List / tuple
-    # --------------------------------------------------------
 
     if isinstance(
         detections,
@@ -433,10 +599,6 @@ def normalize_detection_result(detections):
                 f"{type(exc).__name__}: {exc}"
             )
 
-    # --------------------------------------------------------
-    # NumPy array
-    # --------------------------------------------------------
-
     if isinstance(
         detections,
         np.ndarray,
@@ -455,10 +617,6 @@ def normalize_detection_result(detections):
                 "NumPy output to DataFrame: "
                 f"{type(exc).__name__}: {exc}"
             )
-
-    # --------------------------------------------------------
-    # Other DataFrame-like objects
-    # --------------------------------------------------------
 
     try:
 
@@ -547,10 +705,13 @@ def run_image_analysis_job(
             status="running",
         )
 
-        if not os.path.exists(image_path):
+        if not os.path.exists(
+            image_path
+        ):
 
             raise FileNotFoundError(
-                f"Image file not found: {image_path}"
+                f"Image file not found: "
+                f"{image_path}"
             )
 
         # ====================================================
@@ -567,7 +728,23 @@ def run_image_analysis_job(
             ),
         )
 
+        print("=" * 60)
+        print(
+            "IMAGE ANALYSIS: MODEL STAGE"
+        )
+        print(
+            f"Job ID: {job_id}"
+        )
+        print(
+            f"File: {original_filename}"
+        )
+        print("=" * 60)
+
         model = get_deepforest_model()
+
+        print(
+            "IMAGE ANALYSIS: MODEL READY"
+        )
 
         # ====================================================
         # 20%
@@ -583,9 +760,7 @@ def run_image_analysis_job(
             ),
         )
 
-        print(
-            "=" * 60
-        )
+        print("=" * 60)
 
         print(
             "Starting DeepForest tree detection..."
@@ -595,9 +770,7 @@ def run_image_analysis_job(
             f"Image: {original_filename}"
         )
 
-        print(
-            "=" * 60
-        )
+        print("=" * 60)
 
         raw_detections = detect_trees(
             model,
@@ -608,11 +781,7 @@ def run_image_analysis_job(
         )
 
         # ----------------------------------------------------
-        # IMPORTANT:
-        #
-        # Do NOT call make_json_safe() here.
-        #
-        # Normalize the DeepForest result into a DataFrame.
+        # Keep AI processing in DataFrame format.
         # ----------------------------------------------------
 
         detections_df = (
@@ -627,12 +796,16 @@ def run_image_analysis_job(
 
         print(
             "DeepForest raw result type:",
-            type(raw_detections).__name__,
+            type(
+                raw_detections
+            ).__name__,
         )
 
         print(
             "Normalized detection type:",
-            type(detections_df).__name__,
+            type(
+                detections_df
+            ).__name__,
         )
 
         print(
@@ -653,6 +826,7 @@ def run_image_analysis_job(
 
         # ====================================================
         # 40%
+        # PREPARE CROWN METRICS
         # ====================================================
 
         update_image_job(
@@ -679,40 +853,73 @@ def run_image_analysis_job(
             ),
         )
 
-        crown_metrics_df = (
+        crown_metrics_result = (
             compute_crown_metrics(
                 detections_df,
                 pixel_size_m=0.1,
             )
         )
 
-        if crown_metrics_df is None:
+        # ----------------------------------------------------
+        # Support either:
+        #
+        # 1. DataFrame output
+        # 2. Dictionary output
+        #
+        # from tree_detection.py
+        # ----------------------------------------------------
+
+        if crown_metrics_result is None:
 
             crown_metrics_df = (
                 pd.DataFrame()
             )
 
-        if not isinstance(
-            crown_metrics_df,
+        elif isinstance(
+            crown_metrics_result,
             pd.DataFrame,
         ):
+
+            crown_metrics_df = (
+                crown_metrics_result
+            )
+
+        elif isinstance(
+            crown_metrics_result,
+            dict,
+        ):
+
+            crown_metrics_df = pd.DataFrame(
+                [
+                    crown_metrics_result
+                ]
+            )
+
+        else:
 
             try:
 
                 crown_metrics_df = pd.DataFrame(
-                    crown_metrics_df
+                    crown_metrics_result
                 )
 
             except Exception as exc:
 
                 raise RuntimeError(
                     "compute_crown_metrics() returned "
-                    f"{type(crown_metrics_df).__name__}. "
+                    f"{type(crown_metrics_result).__name__}. "
                     f"Could not normalize: {exc}"
                 )
 
         print(
             "Crown metrics complete."
+        )
+
+        print(
+            "Crown metrics type:",
+            type(
+                crown_metrics_result
+            ).__name__,
         )
 
         # ====================================================
@@ -738,9 +945,9 @@ def run_image_analysis_job(
         )
 
         # ----------------------------------------------------
-        # segment_tree_crowns() must return:
+        # Expected:
         #
-        # (DataFrame, list_of_masks)
+        # (segmentation_dataframe, crown_masks)
         # ----------------------------------------------------
 
         if not isinstance(
@@ -789,10 +996,8 @@ def run_image_analysis_job(
 
             try:
 
-                segmentation_df = (
-                    pd.DataFrame(
-                        segmentation_df
-                    )
+                segmentation_df = pd.DataFrame(
+                    segmentation_df
                 )
 
             except Exception as exc:
@@ -845,9 +1050,16 @@ def run_image_analysis_job(
         # ====================================================
 
         canopy_coverage_percent = 0.0
+
         total_crown_area_m2 = 0.0
+
         canopy_pixels = 0
+
         total_image_pixels = 0
+
+        # ----------------------------------------------------
+        # Read segmentation-derived values when available.
+        # ----------------------------------------------------
 
         if not segmentation_df.empty:
 
@@ -864,8 +1076,8 @@ def run_image_analysis_job(
 
                 if pd.notna(value):
 
-                    canopy_coverage_percent = (
-                        float(value)
+                    canopy_coverage_percent = float(
+                        value
                     )
 
             if (
@@ -881,8 +1093,8 @@ def run_image_analysis_job(
 
                 if pd.notna(value):
 
-                    total_crown_area_m2 = (
-                        float(value)
+                    total_crown_area_m2 = float(
+                        value
                     )
 
             if (
@@ -919,6 +1131,29 @@ def run_image_analysis_job(
                         value
                     )
 
+        # ----------------------------------------------------
+        # Fallback to crown_metrics_result dictionary.
+        #
+        # This is useful with the current tree_detection.py.
+        # ----------------------------------------------------
+
+        if (
+            isinstance(
+                crown_metrics_result,
+                dict,
+            )
+        ):
+
+            if total_crown_area_m2 <= 0:
+
+                total_crown_area_m2 = float(
+                    crown_metrics_result.get(
+                        "total_crown_area_m2",
+                        0.0,
+                    )
+                    or 0.0
+                )
+
         # ====================================================
         # 70%
         # BIOMASS
@@ -932,10 +1167,6 @@ def run_image_analysis_job(
                 "Estimating per-tree aboveground biomass."
             ),
         )
-
-        # ----------------------------------------------------
-        # Copy segmentation DataFrame.
-        # ----------------------------------------------------
 
         biomass_input_df = (
             segmentation_df.copy()
@@ -975,12 +1206,6 @@ def run_image_analysis_job(
 
         else:
 
-            # ------------------------------------------------
-            # Empty result is allowed.
-            # But non-empty data without crown diameter
-            # cannot be used for biomass.
-            # ------------------------------------------------
-
             if not biomass_input_df.empty:
 
                 raise RuntimeError(
@@ -1008,10 +1233,7 @@ def run_image_analysis_job(
         )
 
         # ----------------------------------------------------
-        # Fallback:
-        #
-        # If segmentation-derived crown diameter is invalid,
-        # use DeepForest bounding-box crown diameter.
+        # Fallback to standard crown diameter.
         # ----------------------------------------------------
 
         invalid_biomass_diameter = (
@@ -1047,7 +1269,7 @@ def run_image_analysis_job(
             ]
 
         # ----------------------------------------------------
-        # Final validation for non-empty results.
+        # Final validation.
         # ----------------------------------------------------
 
         if not biomass_input_df.empty:
@@ -1073,14 +1295,12 @@ def run_image_analysis_job(
 
                 print(
                     f"Warning: {invalid_count} trees "
-                    "have invalid crown diameter. "
-                    "They will be excluded/handled "
-                    "by the biomass pipeline."
+                    "have invalid crown diameter."
                 )
 
-        # ----------------------------------------------------
+        # ====================================================
         # BIOMASS PIPELINE
-        # ----------------------------------------------------
+        # ====================================================
 
         biomass_result_df = (
             per_tree_biomass_pipeline(
@@ -1105,10 +1325,8 @@ def run_image_analysis_job(
 
             try:
 
-                biomass_result_df = (
-                    pd.DataFrame(
-                        biomass_result_df
-                    )
+                biomass_result_df = pd.DataFrame(
+                    biomass_result_df
                 )
 
             except Exception as exc:
@@ -1128,13 +1346,19 @@ def run_image_analysis_job(
         # ====================================================
 
         total_agb_kg = 0.0
+
         total_agb_tonnes = 0.0
+
         total_carbon_tonnes = 0.0
+
         total_co2e_tonnes = 0.0
 
         if not biomass_result_df.empty:
 
-            if "agb_kg" in biomass_result_df.columns:
+            if (
+                "agb_kg"
+                in biomass_result_df.columns
+            ):
 
                 total_agb_kg = float(
                     pd.to_numeric(
@@ -1147,7 +1371,10 @@ def run_image_analysis_job(
                     .sum()
                 )
 
-            if "agb_tonnes" in biomass_result_df.columns:
+            if (
+                "agb_tonnes"
+                in biomass_result_df.columns
+            ):
 
                 total_agb_tonnes = float(
                     pd.to_numeric(
@@ -1160,7 +1387,10 @@ def run_image_analysis_job(
                     .sum()
                 )
 
-            if "carbon_tonnes" in biomass_result_df.columns:
+            if (
+                "carbon_tonnes"
+                in biomass_result_df.columns
+            ):
 
                 total_carbon_tonnes = float(
                     pd.to_numeric(
@@ -1173,7 +1403,10 @@ def run_image_analysis_job(
                     .sum()
                 )
 
-            if "co2e_tonnes" in biomass_result_df.columns:
+            if (
+                "co2e_tonnes"
+                in biomass_result_df.columns
+            ):
 
                 total_co2e_tonnes = float(
                     pd.to_numeric(
@@ -1324,6 +1557,7 @@ def run_image_analysis_job(
 
         # ====================================================
         # 95%
+        # FINALIZING
         # ====================================================
 
         update_image_job(
@@ -1337,16 +1571,17 @@ def run_image_analysis_job(
 
         # ====================================================
         # 100%
+        # COMPLETE
         # ====================================================
 
         complete_image_job(
             job_id,
-            make_json_safe(result),
+            make_json_safe(
+                result
+            ),
         )
 
-        print(
-            "=" * 60
-        )
+        print("=" * 60)
 
         print(
             "IMAGE ANALYSIS COMPLETED"
@@ -1366,17 +1601,13 @@ def run_image_analysis_job(
             f"{total_agb_tonnes:.4f} tonnes"
         )
 
-        print(
-            "=" * 60
-        )
+        print("=" * 60)
 
     except Exception as exc:
 
         traceback.print_exc()
 
-        print(
-            "=" * 60
-        )
+        print("=" * 60)
 
         print(
             "IMAGE ANALYSIS FAILED"
@@ -1386,9 +1617,7 @@ def run_image_analysis_job(
             f"{type(exc).__name__}: {exc}"
         )
 
-        print(
-            "=" * 60
-        )
+        print("=" * 60)
 
         fail_image_job(
             job_id,
@@ -1399,6 +1628,10 @@ def run_image_analysis_job(
         )
 
     finally:
+
+        # ----------------------------------------------------
+        # Always remove temporary upload.
+        # ----------------------------------------------------
 
         try:
 
@@ -1429,6 +1662,7 @@ def run_image_analysis_job(
 def root():
 
     return {
+
         "service":
             "SYLVASENSE AI backend",
 
@@ -1494,7 +1728,9 @@ def health():
 # IMAGE ANALYSIS
 # ============================================================
 
-@app.post("/api/image-analyze")
+@app.post(
+    "/api/image-analyze"
+)
 async def image_analyze(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
@@ -1755,6 +1991,14 @@ async def startup_event():
 
     print(
         "Per-tree biomass: AI backend"
+    )
+
+    print(
+        "DeepForest model: lazy-loaded"
+    )
+
+    print(
+        "Model initialization: thread-safe"
     )
 
     print("=" * 60)
