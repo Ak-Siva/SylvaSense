@@ -26,3 +26,4 @@ kornia
 folium>=0.16
 streamlit-folium>=0.23
 earthengine-api>=1.5
+google-auth>=2.29

@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import tempfile
 import os
+import json
 import traceback
 import uuid
 import math
@@ -25,6 +26,8 @@ import numpy as np
 import pandas as pd
 
 import ee
+
+from google.oauth2 import service_account
 
 from tree_detection import (
     load_model,
@@ -431,6 +434,8 @@ def build_satellite_region(
 
 # ============================================================
 # EARTH ENGINE INITIALIZATION
+#
+# RENDER / SERVICE ACCOUNT AUTHENTICATION
 # ============================================================
 
 def initialize_earth_engine():
@@ -440,12 +445,102 @@ def initialize_earth_engine():
         "syylvasense",
     )
 
-    ee.Initialize(
-        project=project
+    service_account_json = os.getenv(
+        "GEE_SERVICE_ACCOUNT_JSON"
     )
 
-    return project
+    if not service_account_json:
 
+        raise RuntimeError(
+            "Earth Engine authentication is not configured "
+            "on Render. Missing GEE_SERVICE_ACCOUNT_JSON "
+            "environment variable."
+        )
+
+    try:
+
+        # ----------------------------------------------------
+        # Read service-account JSON stored in Render
+        # ----------------------------------------------------
+
+        credentials_info = json.loads(
+            service_account_json
+        )
+
+        # ----------------------------------------------------
+        # Create Google service-account credentials
+        # ----------------------------------------------------
+
+        credentials = (
+            service_account.Credentials.from_service_account_info(
+                credentials_info,
+                scopes=[
+                    "https://www.googleapis.com/auth/earthengine",
+                    "https://www.googleapis.com/auth/cloud-platform",
+                ],
+            )
+        )
+
+        # ----------------------------------------------------
+        # Initialize Earth Engine
+        # ----------------------------------------------------
+
+        ee.Initialize(
+            credentials=credentials,
+            project=project,
+        )
+
+        # ----------------------------------------------------
+        # Verify that Earth Engine is actually reachable
+        # ----------------------------------------------------
+
+        ee.Number(1).getInfo()
+
+        print(
+            "=================================================="
+        )
+
+        print(
+            "EARTH ENGINE AUTHENTICATION SUCCESSFUL"
+        )
+
+        print(
+            f"Earth Engine project: {project}"
+        )
+
+        print(
+            f"Service account: "
+            f"{credentials_info.get('client_email', 'unknown')}"
+        )
+
+        print(
+            "=================================================="
+        )
+
+        return project
+
+    except Exception as exc:
+
+        print(
+            "=================================================="
+        )
+
+        print(
+            "EARTH ENGINE AUTHENTICATION FAILED"
+        )
+
+        print(
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        print(
+            "=================================================="
+        )
+
+        raise RuntimeError(
+            "Earth Engine authentication failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
 
 # ============================================================
 # SENTINEL-2 CLOUD MASK
