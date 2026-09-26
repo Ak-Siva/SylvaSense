@@ -3,38 +3,39 @@ const API_BASE = (
   "https://sylvasense-backend-kc8t.onrender.com"
 ).replace(/\/$/, "");
 
+const AI_API_BASE = (
+  import.meta.env.VITE_AI_API_BASE_URL ||
+  "http://localhost:8002"
+).replace(/\/$/, "");
+
 /**
  * ============================================================
  * GENERIC API REQUEST HELPER
  * ============================================================
  */
 
-async function request(path, options = {}) {
+async function request(path, options = {}, baseUrl = API_BASE) {
   let response;
 
   try {
     response = await fetch(
-      `${API_BASE}${path}`,
+      `${baseUrl}${path}`,
       options
     );
   } catch (error) {
     throw new Error(
-      `Cannot connect to SylvaSense backend at ${API_BASE}. ` +
-        `Make sure FastAPI is running on port 8001.`
+      `Cannot connect to SylvaSense backend at ${baseUrl}. ` +
+        `Make sure the backend is running and accessible.`
     );
   }
 
   let data = null;
 
   const contentType =
-    response.headers.get(
-      "content-type"
-    ) || "";
+    response.headers.get("content-type") || "";
 
   if (
-    contentType.includes(
-      "application/json"
-    )
+    contentType.includes("application/json")
   ) {
     try {
       data = await response.json();
@@ -42,8 +43,7 @@ async function request(path, options = {}) {
       data = null;
     }
   } else {
-    const text =
-      await response.text();
+    const text = await response.text();
 
     data = text
       ? { detail: text }
@@ -60,20 +60,12 @@ async function request(path, options = {}) {
     if (Array.isArray(message)) {
       message = message
         .map((item) => {
-          if (
-            typeof item ===
-            "string"
-          ) {
+          if (typeof item === "string") {
             return item;
           }
 
-          if (
-            item?.loc &&
-            item?.msg
-          ) {
-            return `${item.loc.join(
-              "."
-            )}: ${item.msg}`;
+          if (item?.loc && item?.msg) {
+            return `${item.loc.join(".")}: ${item.msg}`;
           }
 
           if (item?.msg) {
@@ -81,9 +73,7 @@ async function request(path, options = {}) {
           }
 
           try {
-            return JSON.stringify(
-              item
-            );
+            return JSON.stringify(item);
           } catch {
             return String(item);
           }
@@ -91,18 +81,11 @@ async function request(path, options = {}) {
         .join("\n");
     }
 
-    if (
-      typeof message ===
-      "object"
-    ) {
+    if (typeof message === "object") {
       try {
-        message =
-          JSON.stringify(
-            message
-          );
+        message = JSON.stringify(message);
       } catch {
-        message =
-          String(message);
+        message = String(message);
       }
     }
 
@@ -124,23 +107,17 @@ async function request(path, options = {}) {
 function fileRequest(
   path,
   file,
-  extra = {}
+  extra = {},
+  baseUrl = API_BASE
 ) {
-  const form =
-    new FormData();
+  const form = new FormData();
 
-  form.append(
-    "file",
-    file
-  );
+  form.append("file", file);
 
-  Object.entries(
-    extra
-  ).forEach(
+  Object.entries(extra).forEach(
     ([key, value]) => {
       if (
-        value !==
-          undefined &&
+        value !== undefined &&
         value !== null &&
         value !== ""
       ) {
@@ -157,7 +134,8 @@ function fileRequest(
     {
       method: "POST",
       body: form,
-    }
+    },
+    baseUrl
   );
 }
 
@@ -167,30 +145,18 @@ function fileRequest(
  * ============================================================
  */
 
-export function isEndpointUnavailable(
-  error
-) {
+export function isEndpointUnavailable(error) {
   const message = String(
     error?.message || ""
   ).toLowerCase();
 
   return (
-    message.includes(
-      "failed to fetch"
-    ) ||
-    message.includes(
-      "networkerror"
-    ) ||
-    message.includes(
-      "err_connection_refused"
-    ) ||
-    message.includes(
-      "connection refused"
-    ) ||
+    message.includes("failed to fetch") ||
+    message.includes("networkerror") ||
+    message.includes("err_connection_refused") ||
+    message.includes("connection refused") ||
     message.includes("404") ||
-    message.includes(
-      "not found"
-    )
+    message.includes("not found")
   );
 }
 
@@ -204,11 +170,15 @@ export function getApiBase() {
   return API_BASE;
 }
 
+export function getAiApiBase() {
+  return AI_API_BASE;
+}
+
 /**
  * ============================================================
  * IMAGE ANALYSIS PROGRESS POLLING
  *
- * Backend:
+ * AI Backend:
  *
  * POST /api/image-analyze
  *       ↓
@@ -246,10 +216,7 @@ async function pollImageAnalysis(
   while (true) {
     await new Promise(
       (resolve) =>
-        setTimeout(
-          resolve,
-          500
-        )
+        setTimeout(resolve, 500)
     );
 
     let progressResponse;
@@ -257,17 +224,16 @@ async function pollImageAnalysis(
     try {
       progressResponse =
         await fetch(
-          `${API_BASE}/api/image-analysis-progress/${jobId}`
+          `${AI_API_BASE}/api/image-analysis-progress/${jobId}`
         );
     } catch (error) {
       throw new Error(
-        `Lost connection to the SylvaSense backend while checking image analysis progress. ` +
-          `Make sure FastAPI is still running on port 8001.`
+        `Lost connection to the SylvaSense AI backend while checking image analysis progress. ` +
+          `Make sure the AI backend is still running on port 8002.`
       );
     }
 
-    let progressData =
-      null;
+    let progressData = null;
 
     const contentType =
       progressResponse.headers.get(
@@ -283,8 +249,7 @@ async function pollImageAnalysis(
         progressData =
           await progressResponse.json();
       } catch {
-        progressData =
-          null;
+        progressData = null;
       }
     } else {
       const text =
@@ -295,9 +260,7 @@ async function pollImageAnalysis(
         : null;
     }
 
-    if (
-      !progressResponse.ok
-    ) {
+    if (!progressResponse.ok) {
       let message =
         progressData?.detail ??
         progressData?.message ??
@@ -334,17 +297,13 @@ async function pollImageAnalysis(
                 item
               );
             } catch {
-              return String(
-                item
-              );
+              return String(item);
             }
           })
           .join("\n");
       }
 
-      throw new Error(
-        message
-      );
+      throw new Error(message);
     }
 
     /**
@@ -370,12 +329,50 @@ async function pollImageAnalysis(
      * We pass everything through.
      */
 
+    let percentage = Number(
+      progressData?.progress
+    );
+
+    const current = Number(
+      progressData?.current
+    );
+
+    const total = Number(
+      progressData?.total
+    );
+
+    if (
+      !Number.isFinite(percentage)
+    ) {
+      if (
+        Number.isFinite(current) &&
+        Number.isFinite(total) &&
+        total > 0
+      ) {
+        percentage =
+          (current / total) * 100;
+      } else {
+        percentage = 0;
+      }
+    }
+
+    percentage = Math.max(
+      0,
+      Math.min(100, percentage)
+    );
+
+    const normalizedProgress = {
+      ...progressData,
+      progress: percentage,
+      percentage,
+    };
+
     if (
       typeof onProgress ===
       "function"
     ) {
       onProgress(
-        progressData
+        normalizedProgress
       );
     }
 
@@ -426,9 +423,11 @@ async function pollImageAnalysis(
  */
 
 export const api = {
+
   /**
    * Backend base URL
    */
+
   baseUrl: API_BASE,
 
   // ==========================================================
@@ -474,7 +473,7 @@ export const api = {
     try {
       response =
         await fetch(
-          `${API_BASE}/api/image-analyze`,
+          `${AI_API_BASE}/api/image-analyze`,
           {
             method: "POST",
             body: form,
@@ -482,8 +481,8 @@ export const api = {
         );
     } catch (error) {
       throw new Error(
-        `Cannot connect to SylvaSense backend at ${API_BASE}. ` +
-          `Make sure FastAPI is running on port 8001.`
+        `Cannot connect to SylvaSense AI backend at ${AI_API_BASE}. ` +
+          `Make sure the AI backend is running on port 8002.`
       );
     }
 
@@ -596,6 +595,11 @@ export const api = {
             data?.progress
           ) || 0,
 
+        percentage:
+          Number(
+            data?.progress
+          ) || 0,
+
         current:
           Number(
             data?.current
@@ -648,7 +652,8 @@ export const api = {
 
         wood_density:
           woodDensity,
-      }
+      },
+      AI_API_BASE
     ),
 
   // ==========================================================
@@ -684,7 +689,9 @@ export const api = {
   ) =>
     fileRequest(
       "/api/crown-segmentation",
-      file
+      file,
+      {},
+      AI_API_BASE
     ),
 
   // ==========================================================
@@ -708,7 +715,8 @@ export const api = {
           JSON.stringify(
             payload
           ),
-      }
+      },
+      AI_API_BASE
     ),
 
   // ==========================================================
@@ -732,7 +740,8 @@ export const api = {
           JSON.stringify(
             payload
           ),
-      }
+      },
+      AI_API_BASE
     ),
 
   // ==========================================================
@@ -825,7 +834,8 @@ export const api = {
 
         confidence_threshold:
           confidenceThreshold,
-      }
+      },
+      AI_API_BASE
     ),
 
   // ==========================================================

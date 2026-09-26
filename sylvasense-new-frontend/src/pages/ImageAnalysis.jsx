@@ -15,65 +15,63 @@ import {
   Database,
 } from "lucide-react";
 
-import {
-  fmt,
-  normalizeAnalysis,
-} from "../utils/normalize";
-
+import { fmt, normalizeAnalysis } from "../utils/normalize";
 import { api } from "../services/api";
-
 import * as UTIF from "utif";
 
 /* =========================================================
-   FIND CANOPY COVERAGE
-========================================================= */
+   FIND NUMERIC VALUE DEEPLY
+   ========================================================= */
 
-function findCanopyCoverage(data) {
+function findNumericValueDeep(data, keys) {
   if (data === null || data === undefined) {
     return null;
   }
 
-  if (
-    typeof data === "object" &&
-    !Array.isArray(data) &&
-    data.canopy_coverage_percent !== null &&
-    data.canopy_coverage_percent !== undefined
-  ) {
-    const value = Number(data.canopy_coverage_percent);
-
-    if (!Number.isNaN(value)) {
-      return value;
-    }
-  }
-
   if (Array.isArray(data)) {
     for (const item of data) {
-      const value = findCanopyCoverage(item);
+      const found = findNumericValueDeep(item, keys);
 
       if (
-        value !== null &&
-        value !== undefined &&
-        !Number.isNaN(value)
+        found !== null &&
+        found !== undefined &&
+        !Number.isNaN(found)
       ) {
-        return value;
+        return found;
       }
     }
 
     return null;
   }
 
-  if (typeof data === "object") {
-    for (const value of Object.values(data)) {
-      if (value !== null && typeof value === "object") {
-        const found = findCanopyCoverage(value);
+  if (typeof data !== "object") {
+    return null;
+  }
 
-        if (
-          found !== null &&
-          found !== undefined &&
-          !Number.isNaN(found)
-        ) {
-          return found;
-        }
+  for (const key of keys) {
+    if (
+      Object.prototype.hasOwnProperty.call(data, key) &&
+      data[key] !== null &&
+      data[key] !== undefined
+    ) {
+      const value = Number(data[key]);
+
+      if (!Number.isNaN(value)) {
+        return value;
+      }
+    }
+  }
+
+  for (const value of Object.values(data)) {
+    if (value !== null && typeof value === "object") {
+      const found = findNumericValueDeep(value, keys);
+
+      if (
+        found !== null &&
+        found !== undefined &&
+        !Number.isNaN(found)
+      ) {
+        return found;
       }
     }
   }
@@ -82,8 +80,144 @@ function findCanopyCoverage(data) {
 }
 
 /* =========================================================
+   FIND CANOPY COVERAGE
+   ========================================================= */
+
+function findCanopyCoverage(data) {
+  return findNumericValueDeep(data, [
+    "canopy_coverage_percent",
+    "canopyCoveragePercent",
+    "canopy_coverage_percentage",
+    "canopyCoveragePercentage",
+    "canopy_percent",
+    "canopyPercent",
+    "coverage_percent",
+    "coveragePercent",
+    "coverage_percentage",
+    "coveragePercentage",
+    "canopy_coverage",
+    "canopyCoverage",
+  ]);
+}
+
+/* =========================================================
+   FIND AGB
+   ========================================================= */
+
+function findAGB(data) {
+  return findNumericValueDeep(data, [
+    "total_agb_tonnes",
+    "total_agb_tons",
+    "total_agb_t",
+    "totalAgbTonnes",
+    "totalAgbTons",
+    "totalAgbT",
+    "total_agb",
+    "totalAgb",
+    "agb_tonnes",
+    "agb_tons",
+    "agb_t",
+    "agb",
+    "AGB",
+    "aboveground_biomass_tonnes",
+    "aboveground_biomass_tons",
+    "aboveground_biomass_t",
+    "abovegroundBiomassTonnes",
+    "abovegroundBiomassTons",
+    "abovegroundBiomassT",
+    "aboveground_biomass",
+    "abovegroundBiomass",
+    "biomass_tonnes",
+    "biomass_tons",
+    "biomass_t",
+    "biomass",
+  ]);
+}
+
+/* =========================================================
+   FIND CARBON
+   ========================================================= */
+
+function findCarbon(data) {
+  return findNumericValueDeep(data, [
+    "total_carbon_tonnes",
+    "total_carbon_tons",
+    "total_carbon_t",
+    "totalCarbonTonnes",
+    "totalCarbonTons",
+    "totalCarbonT",
+    "total_carbon",
+    "totalCarbon",
+    "carbon_tonnes",
+    "carbon_tons",
+    "carbon_t",
+    "carbon",
+  ]);
+}
+
+/* =========================================================
+   FIND CO2E
+   ========================================================= */
+
+function findCO2e(data) {
+  return findNumericValueDeep(data, [
+    "total_co2e_tonnes",
+    "total_co2e_tons",
+    "total_co2e_t",
+    "totalCO2eTonnes",
+    "totalCO2eTons",
+    "totalCO2eT",
+    "total_co2e",
+    "totalCO2e",
+    "co2e_tonnes",
+    "co2e_tons",
+    "co2e_t",
+    "co2e",
+    "CO2e",
+  ]);
+}
+
+/* =========================================================
+   FIND TREE COUNT
+   ========================================================= */
+
+function findTreeCount(data) {
+  return findNumericValueDeep(data, [
+    "tree_count",
+    "treeCount",
+    "trees_detected",
+    "treesDetected",
+    "detected_trees",
+    "detectedTrees",
+    "number_of_trees",
+    "numberOfTrees",
+  ]);
+}
+
+/* =========================================================
+   FIND CROWN COUNT
+   ========================================================= */
+
+function findCrownCount(data) {
+  const direct = findNumericValueDeep(data, [
+    "crown_count",
+    "crownCount",
+    "crowns_detected",
+    "crownsDetected",
+    "segmentation_count",
+    "segmentationCount",
+  ]);
+
+  if (direct !== null) {
+    return direct;
+  }
+
+  return null;
+}
+
+/* =========================================================
    TIFF TO DATA URL
-========================================================= */
+   ========================================================= */
 
 async function convertTiffToDataUrl(file) {
   const buffer = await file.arrayBuffer();
@@ -125,7 +259,7 @@ async function convertTiffToDataUrl(file) {
 
 /* =========================================================
    IMAGE ANALYSIS
-========================================================= */
+   ========================================================= */
 
 export default function ImageAnalysis({
   result,
@@ -159,10 +293,13 @@ export default function ImageAnalysis({
       return;
     }
 
-    const isImage = nextFile.type.startsWith("image/");
+    const isImage =
+      nextFile.type.startsWith("image/");
 
     const isSupportedExtension =
-      /\.(jpg|jpeg|png|tif|tiff)$/i.test(nextFile.name);
+      /\.(jpg|jpeg|png|tif|tiff)$/i.test(
+        nextFile.name
+      );
 
     if (!isImage && !isSupportedExtension) {
       setLocalError(
@@ -187,16 +324,21 @@ export default function ImageAnalysis({
         /\.(tif|tiff)$/i.test(nextFile.name);
 
       if (isTiff) {
-        nextUrl = await convertTiffToDataUrl(nextFile);
+        nextUrl =
+          await convertTiffToDataUrl(nextFile);
       } else {
-        nextUrl = URL.createObjectURL(nextFile);
+        nextUrl =
+          URL.createObjectURL(nextFile);
       }
 
       setResult(null);
       setFile(nextFile);
       setFileUrl(nextUrl);
     } catch (err) {
-      console.error("Image preview error:", err);
+      console.error(
+        "Image preview error:",
+        err
+      );
 
       setResult(null);
       setFile(nextFile);
@@ -236,7 +378,8 @@ export default function ImageAnalysis({
         "Sending image to FastAPI..."
       );
 
-      const raw = await api.imageAnalyze(file);
+      const raw =
+        await api.imageAnalyze(file);
 
       console.log(
         "SYLVASENSE RAW IMAGE ANALYSIS:",
@@ -247,7 +390,13 @@ export default function ImageAnalysis({
         "Processing tree, crown and biomass results..."
       );
 
-      const normalized = normalizeAnalysis(raw);
+      const normalized =
+        normalizeAnalysis(raw);
+
+      console.log(
+        "SYLVASENSE NORMALIZED IMAGE ANALYSIS:",
+        normalized
+      );
 
       const finalResult = {
         ...normalized,
@@ -266,10 +415,10 @@ export default function ImageAnalysis({
   }
 
   /* =======================================================
-     SOURCE DATA
+     RESULT SOURCE
   ======================================================= */
 
-  const source =
+  const rawSource =
     result?.raw ||
     result ||
     null;
@@ -279,11 +428,8 @@ export default function ImageAnalysis({
   ======================================================= */
 
   const treeCount =
-    source?.tree_count ??
-    source?.treeCount ??
-    source?.modules?.tree_detection?.tree_count ??
-    result?.tree_count ??
-    result?.treeCount ??
+    findTreeCount(result) ??
+    findTreeCount(rawSource) ??
     0;
 
   /* =======================================================
@@ -291,7 +437,7 @@ export default function ImageAnalysis({
   ======================================================= */
 
   const crownSegmentation =
-    source?.modules?.crown_segmentation ??
+    rawSource?.modules?.crown_segmentation ??
     result?.modules?.crown_segmentation ??
     null;
 
@@ -300,78 +446,83 @@ export default function ImageAnalysis({
   ======================================================= */
 
   const crownCount =
-    source?.crown_count ??
-    source?.crownCount ??
-    source?.modules?.crown_segmentation?.tree_count ??
-    source?.modules?.crown_segmentation?.crown_count ??
+    findCrownCount(result) ??
+    findCrownCount(rawSource) ??
     (
       Array.isArray(crownSegmentation)
         ? crownSegmentation.length
-        : result?.crown_count ??
-          result?.crownCount ??
-          0
+        : 0
     );
 
   /* =======================================================
-     BIOMASS
+     AGB
   ======================================================= */
 
-  const biomass =
-    source?.modules?.biomass ??
-    result?.modules?.biomass ??
-    {};
-
   const agb =
-    biomass?.total_agb_tonnes ??
-    source?.total_agb_tonnes ??
-    result?.total_agb_tonnes ??
-    null;
+    findAGB(result) ??
+    findAGB(rawSource);
 
   /* =======================================================
      CARBON
   ======================================================= */
 
   const carbon =
-    biomass?.total_carbon_tonnes ??
-    source?.total_carbon_tonnes ??
-    source?.carbon ??
-    result?.total_carbon_tonnes ??
-    result?.carbon ??
-    null;
+    findCarbon(result) ??
+    findCarbon(rawSource);
 
   /* =======================================================
      CO2 EQUIVALENT
   ======================================================= */
 
   const co2e =
-    biomass?.total_co2e_tonnes ??
-    source?.total_co2e_tonnes ??
-    source?.co2e ??
-    result?.total_co2e_tonnes ??
-    result?.co2e ??
-    null;
+    findCO2e(result) ??
+    findCO2e(rawSource);
 
   /* =======================================================
      CANOPY COVERAGE
+
+     Backend confirmed value:
+     canopy_coverage_percent = 38.364375
   ======================================================= */
 
   const canopyCoverage =
-    findCanopyCoverage(
-      crownSegmentation
-    );
+    findCanopyCoverage(result) ??
+    findCanopyCoverage(rawSource);
 
   const canopyDisplay =
     canopyCoverage !== null &&
     canopyCoverage !== undefined &&
-    !Number.isNaN(canopyCoverage)
-      ? `${fmt(canopyCoverage)}%`
+    !Number.isNaN(Number(canopyCoverage))
+      ? `${fmt(Number(canopyCoverage), 2)}%`
       : "—";
+
+  /* =======================================================
+     DEBUG
+
+     This makes it very easy to verify exactly what the
+     frontend is receiving.
+  ======================================================= */
+
+  if (result) {
+    console.log(
+      "SYLVASENSE FINAL DISPLAY VALUES:",
+      {
+        treeCount,
+        crownCount,
+        agb,
+        carbon,
+        co2e,
+        canopyCoverage,
+      }
+    );
+  }
 
   /* =======================================================
      RESULT STATE
   ======================================================= */
 
-  const hasResult = Boolean(result);
+  const hasResult =
+    Boolean(result);
 
   /* =======================================================
      RENDER
@@ -385,23 +536,29 @@ export default function ImageAnalysis({
       ================================================= */}
 
       <div className="dashboard-header">
+
         <div>
+
           <div className="dashboard-title">
+
             <ScanSearch size={30} />
 
             <h1>
               Image Analysis
             </h1>
+
           </div>
 
           <p>
             Upload forest imagery and run the
             SYLVASENSE AI analysis pipeline.
           </p>
+
         </div>
 
         {analysisRunning &&
           analysisType === "Image Analysis" && (
+
             <div
               className="badge"
               style={{
@@ -411,14 +568,18 @@ export default function ImageAnalysis({
                 padding: "9px 13px",
               }}
             >
+
               <RefreshCw
                 size={16}
                 className="spin"
               />
 
               Analyzing...
+
             </div>
-          )}
+
+        )}
+
       </div>
 
       {/* =================================================
@@ -426,18 +587,22 @@ export default function ImageAnalysis({
       ================================================= */}
 
       {(localError || analysisError) && (
+
         <div
           className="error-box"
           style={{
             marginBottom: "18px",
           }}
         >
+
           <X size={18} />
 
           <span>
             {localError || analysisError}
           </span>
+
         </div>
+
       )}
 
       {/* =================================================
@@ -464,8 +629,11 @@ export default function ImageAnalysis({
             padding: "18px",
           }}
         >
+
           <div className="panel-head">
+
             <div>
+
               <h3>
                 Forest Imagery
               </h3>
@@ -473,9 +641,11 @@ export default function ImageAnalysis({
               <p>
                 Upload an image for AI analysis.
               </p>
+
             </div>
 
             <Upload size={21} />
+
           </div>
 
           {/* UPLOAD AREA */}
@@ -503,6 +673,7 @@ export default function ImageAnalysis({
               );
             }}
           >
+
             <div
               style={{
                 width: "52px",
@@ -518,7 +689,9 @@ export default function ImageAnalysis({
                 marginBottom: "12px",
               }}
             >
+
               <Upload size={25} />
+
             </div>
 
             <h3
@@ -549,6 +722,7 @@ export default function ImageAnalysis({
                     : "pointer",
               }}
             >
+
               Select Image
 
               <input
@@ -564,9 +738,11 @@ export default function ImageAnalysis({
                   display: "none",
                 }}
               />
+
             </label>
 
             {file && (
+
               <div
                 style={{
                   marginTop: "13px",
@@ -583,6 +759,7 @@ export default function ImageAnalysis({
                   whiteSpace: "nowrap",
                 }}
               >
+
                 <FileImage
                   size={14}
                   style={{
@@ -592,8 +769,11 @@ export default function ImageAnalysis({
                 />
 
                 {file.name}
+
               </div>
+
             )}
+
           </div>
 
           {/* ANALYZE BUTTON */}
@@ -611,7 +791,9 @@ export default function ImageAnalysis({
             }
             onClick={analyze}
           >
+
             {analysisRunning ? (
+
               <>
                 <RefreshCw
                   size={18}
@@ -620,14 +802,19 @@ export default function ImageAnalysis({
 
                 Analyzing...
               </>
+
             ) : (
+
               <>
                 <BrainCircuit size={18} />
 
                 Run Complete Analysis
               </>
+
             )}
+
           </button>
+
         </div>
 
         {/* =================================================
@@ -640,6 +827,7 @@ export default function ImageAnalysis({
             padding: "12px",
           }}
         >
+
           <div
             style={{
               display: "flex",
@@ -648,7 +836,9 @@ export default function ImageAnalysis({
               padding: "4px 6px 10px",
             }}
           >
+
             <div>
+
               <h3
                 style={{
                   margin: 0,
@@ -668,15 +858,14 @@ export default function ImageAnalysis({
                   ? file.name
                   : "Selected forest imagery appears here."}
               </p>
+
             </div>
 
             <FileImage size={21} />
+
           </div>
 
-          {/* =================================================
-              CORRECT IMAGE CONTAINER
-              Keeps original aspect ratio
-          ================================================= */}
+          {/* IMAGE CONTAINER */}
 
           <div
             style={{
@@ -695,7 +884,9 @@ export default function ImageAnalysis({
               padding: "12px",
             }}
           >
+
             {fileUrl ? (
+
               <img
                 src={fileUrl}
                 alt={
@@ -718,7 +909,9 @@ export default function ImageAnalysis({
                   borderRadius: "8px",
                 }}
               />
+
             ) : (
+
               <div
                 style={{
                   display: "flex",
@@ -731,16 +924,22 @@ export default function ImageAnalysis({
                   padding: "30px",
                 }}
               >
+
                 <FileImage size={42} />
 
                 <span>
                   Select a forest image
                   to preview it here.
                 </span>
+
               </div>
+
             )}
+
           </div>
+
         </div>
+
       </div>
 
       {/* =================================================
@@ -749,6 +948,7 @@ export default function ImageAnalysis({
 
       {analysisRunning &&
         analysisType === "Image Analysis" && (
+
           <div
             className="panel"
             style={{
@@ -759,6 +959,7 @@ export default function ImageAnalysis({
                 "rgba(31,126,76,0.08)",
             }}
           >
+
             <div
               style={{
                 display: "flex",
@@ -766,6 +967,7 @@ export default function ImageAnalysis({
                 gap: "12px",
               }}
             >
+
               <RefreshCw
                 size={25}
                 className="spin"
@@ -776,6 +978,7 @@ export default function ImageAnalysis({
                   flex: 1,
                 }}
               >
+
                 <strong>
                   Analysis in progress
                 </strong>
@@ -788,11 +991,13 @@ export default function ImageAnalysis({
                   {analysisStatus ||
                     "FastAPI is processing the image..."}
                 </p>
+
               </div>
 
               <span className="badge">
                 RUNNING
               </span>
+
             </div>
 
             <div
@@ -806,6 +1011,7 @@ export default function ImageAnalysis({
                   "rgba(255,255,255,0.08)",
               }}
             >
+
               <div
                 style={{
                   width: "55%",
@@ -815,6 +1021,7 @@ export default function ImageAnalysis({
                     "pulse 1.5s ease-in-out infinite",
                 }}
               />
+
             </div>
 
             <small
@@ -828,7 +1035,9 @@ export default function ImageAnalysis({
               The analysis will continue in the
               background.
             </small>
+
           </div>
+
         )}
 
       {/* =================================================
@@ -841,8 +1050,11 @@ export default function ImageAnalysis({
           marginTop: "18px",
         }}
       >
+
         <div className="panel-head">
+
           <div>
+
             <h3>
               Analysis Results
             </h3>
@@ -851,13 +1063,17 @@ export default function ImageAnalysis({
               AI-derived forest measurements from
               the FastAPI backend.
             </p>
+
           </div>
 
           {hasResult && (
+
             <span className="badge success">
               LIVE
             </span>
+
           )}
+
         </div>
 
         {/* RESULT CARDS */}
@@ -868,9 +1084,11 @@ export default function ImageAnalysis({
             marginTop: "14px",
           }}
         >
+
           {/* TREE COUNT */}
 
           <div className="metric-card">
+
             <div className="metric-icon">
               <TreePine size={20} />
             </div>
@@ -882,11 +1100,13 @@ export default function ImageAnalysis({
             <div className="metric-value">
               {fmt(treeCount, 0)}
             </div>
+
           </div>
 
           {/* CROWN */}
 
           <div className="metric-card">
+
             <div className="metric-icon">
               <Leaf size={20} />
             </div>
@@ -898,11 +1118,13 @@ export default function ImageAnalysis({
             <div className="metric-value">
               {fmt(crownCount, 0)}
             </div>
+
           </div>
 
           {/* AGB */}
 
           <div className="metric-card">
+
             <div className="metric-icon">
               <TreePine size={20} />
             </div>
@@ -912,16 +1134,21 @@ export default function ImageAnalysis({
             </div>
 
             <div className="metric-value">
+
               {agb !== null &&
-              agb !== undefined
-                ? `${fmt(agb)} t`
-                : "— t"}
+              agb !== undefined &&
+              !Number.isNaN(Number(agb))
+                ? `${fmt(Number(agb), 2)} t`
+                : "—"}
+
             </div>
+
           </div>
 
           {/* CARBON */}
 
           <div className="metric-card">
+
             <div className="metric-icon">
               <Leaf size={20} />
             </div>
@@ -931,16 +1158,21 @@ export default function ImageAnalysis({
             </div>
 
             <div className="metric-value">
+
               {carbon !== null &&
-              carbon !== undefined
-                ? `${fmt(carbon)} t C`
-                : "— t C"}
+              carbon !== undefined &&
+              !Number.isNaN(Number(carbon))
+                ? `${fmt(Number(carbon), 2)} t C`
+                : "—"}
+
             </div>
+
           </div>
 
           {/* CO2 */}
 
           <div className="metric-card">
+
             <div className="metric-icon">
               <Database size={20} />
             </div>
@@ -950,16 +1182,21 @@ export default function ImageAnalysis({
             </div>
 
             <div className="metric-value">
+
               {co2e !== null &&
-              co2e !== undefined
-                ? `${fmt(co2e)} t`
-                : "— t"}
+              co2e !== undefined &&
+              !Number.isNaN(Number(co2e))
+                ? `${fmt(Number(co2e), 2)} t`
+                : "—"}
+
             </div>
+
           </div>
 
           {/* CANOPY */}
 
           <div className="metric-card">
+
             <div className="metric-icon">
               <Leaf size={20} />
             </div>
@@ -971,7 +1208,9 @@ export default function ImageAnalysis({
             <div className="metric-value">
               {canopyDisplay}
             </div>
+
           </div>
+
         </div>
 
         {/* DASHBOARD */}
@@ -987,10 +1226,13 @@ export default function ImageAnalysis({
             setPage("dashboard")
           }
         >
+
           <ChevronRight size={17} />
 
           View Dashboard
+
         </button>
+
       </div>
 
       {/* =================================================
@@ -998,14 +1240,18 @@ export default function ImageAnalysis({
       ================================================= */}
 
       {result && (
+
         <div
           className="panel"
           style={{
             marginTop: "18px",
           }}
         >
+
           <div className="panel-head">
+
             <div>
+
               <h3>
                 Backend Analysis Data
               </h3>
@@ -1013,11 +1259,13 @@ export default function ImageAnalysis({
               <p>
                 Complete response returned by FastAPI.
               </p>
+
             </div>
 
             <span className="badge success">
               API
             </span>
+
           </div>
 
           <pre
@@ -1038,8 +1286,11 @@ export default function ImageAnalysis({
               2
             )}
           </pre>
+
         </div>
+
       )}
+
     </main>
   );
 }
